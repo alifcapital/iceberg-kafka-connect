@@ -93,6 +93,7 @@ public class DebeziumTransform<R extends ConnectRecord<R>> implements Transforma
     cdcMetadata.put(CdcConstants.COL_OP, op);
     cdcMetadata.put(CdcConstants.COL_TS, new java.util.Date(value.getInt64("ts_ms")));
     if (record instanceof SinkRecord) {
+      cdcMetadata.put(CdcConstants.COL_PARTITION, ((SinkRecord) record).kafkaPartition());
       cdcMetadata.put(CdcConstants.COL_OFFSET, ((SinkRecord) record).kafkaOffset());
     }
     setTableAndTargetFromSourceStruct(value.getStruct("source"), cdcMetadata);
@@ -218,6 +219,7 @@ public class DebeziumTransform<R extends ConnectRecord<R>> implements Transforma
         SchemaBuilder.struct()
             .field(CdcConstants.COL_OP, Schema.STRING_SCHEMA)
             .field(CdcConstants.COL_TS, Timestamp.SCHEMA)
+            .field(CdcConstants.COL_PARTITION, Schema.INT32_SCHEMA)
             .field(CdcConstants.COL_OFFSET, Schema.OPTIONAL_INT64_SCHEMA)
             .field(CdcConstants.COL_SOURCE, Schema.STRING_SCHEMA)
             .field(CdcConstants.COL_TARGET, Schema.STRING_SCHEMA);
