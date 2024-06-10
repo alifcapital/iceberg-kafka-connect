@@ -110,8 +110,8 @@ public class DebeziumTransform<R extends ConnectRecord<R>> implements Transforma
     for (Field field : payloadSchema.fields()) {
       newValue.put(field.name(), payload.get(field));
     }
-    newValue.put(CdcConstants.COL_OP, cdcMetadata.get(CdcConstants.COL_OP));
-    newValue.put(CdcConstants.COL_TS, cdcMetadata.get(CdcConstants.COL_TS));
+    newValue.put("_cdc_op", cdcMetadata.get(CdcConstants.COL_OP));
+    newValue.put("_cdc_tsms", cdcMetadata.get(CdcConstants.COL_TS));
     newValue.put(CdcConstants.COL_CDC, cdcMetadata);
 
     return record.newRecord(
@@ -250,8 +250,8 @@ public class DebeziumTransform<R extends ConnectRecord<R>> implements Transforma
       builder.field(field.name(), field.schema());
     }
 
-    builder.field(CdcConstants.COL_OP, Schema.STRING_SCHEMA);
-    builder.field(CdcConstants.COL_TS, Timestamp.SCHEMA);
+    builder.field("_cdc_op", Schema.STRING_SCHEMA);
+    builder.field("_cdc_tsms", Timestamp.SCHEMA);
     builder.field(CdcConstants.COL_CDC, cdcSchema);
 
     return builder.build();
