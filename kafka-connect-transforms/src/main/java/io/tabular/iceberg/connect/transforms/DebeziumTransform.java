@@ -96,7 +96,8 @@ public class DebeziumTransform<R extends ConnectRecord<R>> implements Transforma
       cdcMetadata.put(CdcConstants.COL_PARTITION, ((SinkRecord) record).kafkaPartition());
       cdcMetadata.put(CdcConstants.COL_OFFSET, ((SinkRecord) record).kafkaOffset());
     }
-    setTableAndTargetFromSourceStruct(value.getStruct("source"), cdcMetadata);
+    setTableSourceFromSourceStruct(value.getStruct("source"), cdcMetadata);
+    setTableTargetFromTopic(record.topic(), cdcMetadata);
 
     if (record.keySchema() != null) {
       cdcMetadata.put(CdcConstants.COL_KEY, record.key());
@@ -178,7 +179,7 @@ public class DebeziumTransform<R extends ConnectRecord<R>> implements Transforma
     }
   }
 
-  private void setTableAndTargetFromSourceStruct(Struct source, Struct cdcMetadata) {
+  private void setTableSourceFromSourceStruct(Struct source, Struct cdcMetadata) {
     String db;
     if (source.schema().field("schema") != null) {
       // prefer schema if present, e.g. for Postgres
@@ -189,6 +190,15 @@ public class DebeziumTransform<R extends ConnectRecord<R>> implements Transforma
     String table = source.getString("table");
 
     cdcMetadata.put(CdcConstants.COL_SOURCE, db + "." + table);
+  }
+
+  private void setTableTargetFromTopic(String topic, Struct cdcMetadata) {
+    String db;
+    String table;
+    String[] parts = topic.split(".");
+
+    db = parts[1];
+    table = parts[2];
     cdcMetadata.put(CdcConstants.COL_TARGET, target(db, table));
   }
 
