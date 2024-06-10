@@ -168,15 +168,6 @@ public class Utilities {
 
     Set<Integer> identifierFieldIds = table.schema().identifierFieldIds();
 
-    // override the identifier fields if the config is set
-    List<String> idCols = config.tableConfig(tableName).idColumns();
-    if (!idCols.isEmpty()) {
-      identifierFieldIds =
-          idCols.stream()
-              .map(colName -> table.schema().findField(colName).fieldId())
-              .collect(toSet());
-    }
-
     FileAppenderFactory<Record> appenderFactory;
     if (identifierFieldIds == null || identifierFieldIds.isEmpty()) {
       appenderFactory =

@@ -18,8 +18,10 @@
  */
 package io.tabular.iceberg.connect.data;
 
+import static java.util.stream.Collectors.toSet
 import io.tabular.iceberg.connect.IcebergSinkConfig;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Table;
@@ -78,7 +80,30 @@ public class IcebergWriterFactory {
         structType = SchemaUtils.toIcebergType(sample.valueSchema(), config).asStructType();
       }
 
-      org.apache.iceberg.Schema schema = new org.apache.iceberg.Schema(structType.fields());
+      org.apache.iceberg.Schema schema;
+
+      if (config.tablesCdcField() != null && config.upsertModeEnabled()) {
+        Set<Integer> equalityFieldIds = Set.of();
+        // Get PK from Kafka topic key
+        if (sample.keySchema() != null) {
+          equalityFieldIds =
+              sample.keySchema().fields().stream()
+                .map(col -> structType.field(col.name()).fieldId())
+                .collect(toSet());
+        }
+        // Override PK with table config
+        List<String> idCols = config.tableConfig(tableName).idColumns();
+        if (!idCols.isEmpty()) {
+          equalityFieldIds =
+            idCols.stream()
+                .map(colName -> structType.field(colName).fieldId())
+                .collect(toSet());
+        }
+
+        schema = new org.apache.iceberg.Schema(structType.fields(), equalityFieldIds);
+      } else {
+        schema = new org.apache.iceberg.Schema(structType.fields());
+      }
       TableIdentifier identifier = TableIdentifier.parse(tableName);
 
       List<String> partitionBy = config.tableConfig(tableName).partitionBy();
