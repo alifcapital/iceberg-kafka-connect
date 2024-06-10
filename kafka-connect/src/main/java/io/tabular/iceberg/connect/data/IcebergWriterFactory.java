@@ -18,7 +18,7 @@
  */
 package io.tabular.iceberg.connect.data;
 
-import static java.util.stream.Collectors.toSet
+import static java.util.stream.Collectors.toSet;
 import io.tabular.iceberg.connect.IcebergSinkConfig;
 import java.util.List;
 import java.util.Set;
