@@ -91,7 +91,7 @@ public class DebeziumTransform<R extends ConnectRecord<R>> implements Transforma
     Schema cdcSchema = makeCdcSchema(record.keySchema());
     Struct cdcMetadata = new Struct(cdcSchema);
     cdcMetadata.put(CdcConstants.COL_OP, op);
-    cdcMetadata.put(CdcConstants.COL_TS, new java.util.Date(value.getInt64("ts_ms")));
+    cdcMetadata.put(CdcConstants.COL_TS, new java.util.Date(value.getStruct("source").getInt64("ts_ms")));
     if (record instanceof SinkRecord) {
       cdcMetadata.put(CdcConstants.COL_PARTITION, ((SinkRecord) record).kafkaPartition());
       cdcMetadata.put(CdcConstants.COL_OFFSET, ((SinkRecord) record).kafkaOffset());
