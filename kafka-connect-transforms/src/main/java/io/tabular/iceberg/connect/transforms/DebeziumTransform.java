@@ -197,7 +197,7 @@ public class DebeziumTransform<R extends ConnectRecord<R>> implements Transforma
   private void setTableTargetFromTopic(String topic, Struct cdcMetadata) {
     String db;
     String table;
-    String[] parts = topic.split(".");
+    String[] parts = topic.split("\\.");
 
     db = parts[1];
     table = parts[2];
