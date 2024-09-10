@@ -53,6 +53,8 @@ import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.util.Tasks;
 import org.apache.iceberg.util.ThreadPools;
 import org.apache.kafka.clients.admin.MemberDescription;
+import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.sink.SinkTaskContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -71,6 +73,7 @@ public class Coordinator extends Channel implements AutoCloseable {
   private final String snapshotOffsetsProp;
   private final ExecutorService exec;
   private final CommitState commitState;
+  private volatile boolean terminated;
 
   public Coordinator(
       Catalog catalog,
@@ -214,6 +217,10 @@ public class Coordinator extends Channel implements AutoCloseable {
             .filter(deleteFile -> deleteFile.recordCount() > 0)
             .collect(toList());
 
+    if (terminated) {
+      throw new ConnectException("Coordinator is terminated, commit aborted");
+    }
+
     if (dataFiles.isEmpty() && deleteFiles.isEmpty()) {
       LOG.info("Nothing to commit to table {}, skipping", tableIdentifier);
     } else {
@@ -302,9 +309,18 @@ public class Coordinator extends Channel implements AutoCloseable {
     return ImmutableMap.of();
   }
 
-  @Override
-  public void close() throws IOException {
+  void terminate() {
+    this.terminated = true;
+
     exec.shutdownNow();
-    stop();
+
+    // wait for coordinator termination, else cause the sink task to fail
+    try {
+      if (!exec.awaitTermination(1, TimeUnit.MINUTES)) {
+        throw new ConnectException("Timed out waiting for coordinator shutdown");
+      }
+    } catch (InterruptedException e) {
+      throw new ConnectException("Interrupted while waiting for coordinator shutdown", e);
+    }
   }
 }
