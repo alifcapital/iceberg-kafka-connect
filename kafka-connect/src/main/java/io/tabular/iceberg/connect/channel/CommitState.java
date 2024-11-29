@@ -80,7 +80,8 @@ public class CommitState {
 
   public boolean isCommitIntervalReached() {
     if (startTime == 0) {
-      startTime = System.currentTimeMillis();
+      // add delay to avoid all nodes starting a commit at the same time
+      startTime = System.currentTimeMillis() - (long)(Math.random() * config.commitIntervalMs());
     }
 
     return (!isCommitInProgress()
@@ -177,3 +178,4 @@ public class CommitState {
     return result;
   }
 }
+
