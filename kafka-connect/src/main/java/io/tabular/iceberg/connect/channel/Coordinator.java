@@ -32,6 +32,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import org.apache.iceberg.AppendFiles;
 import org.apache.iceberg.DataFile;
@@ -309,7 +310,8 @@ public class Coordinator extends Channel implements AutoCloseable {
     return ImmutableMap.of();
   }
 
-  void terminate() {
+  @Override
+  public void close() throws IOException {
     this.terminated = true;
 
     exec.shutdownNow();
@@ -322,5 +324,7 @@ public class Coordinator extends Channel implements AutoCloseable {
     } catch (InterruptedException e) {
       throw new ConnectException("Interrupted while waiting for coordinator shutdown", e);
     }
+
+    stop();
   }
 }

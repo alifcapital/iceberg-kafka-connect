@@ -18,6 +18,7 @@
  */
 package io.tabular.iceberg.connect.channel;
 
+import org.apache.kafka.connect.errors.ConnectException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -45,7 +46,7 @@ public class CoordinatorThread extends Thread {
     }
 
     try {
-      coordinator.close();
+      coordinator.stop();
     } catch (Exception e) {
       LOG.error("Coordinator error during stop, ignoring", e);
     }
@@ -55,8 +56,17 @@ public class CoordinatorThread extends Thread {
     return terminated;
   }
 
-  void terminate() {
-    this.terminated = true;
-    coordinator.terminate();
+  public void terminate() {
+    terminated = true;
+
+    try {
+      join();
+    } catch (InterruptedException e) {
+      throw new ConnectException(e);
+    }
+
+    if (coordinator != null) {
+      throw new ConnectException("Coordinator was not stopped during thread termination");
+    }
   }
 }
