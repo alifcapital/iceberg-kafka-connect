@@ -70,6 +70,9 @@ public class CommitState {
     }
   }
 
+  public long getStartTime() {
+    return startTime;
+  }
   public UUID currentCommitId() {
     return currentCommitId;
   }

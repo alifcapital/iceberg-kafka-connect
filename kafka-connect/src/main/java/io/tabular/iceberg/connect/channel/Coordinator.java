@@ -31,31 +31,39 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import org.apache.iceberg.AppendFiles;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DeleteFile;
+import org.apache.iceberg.FileFormat;
+import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.RowDelta;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.Transaction;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.TableIdentifier;
-import org.apache.iceberg.connect.events.CommitComplete;
-import org.apache.iceberg.connect.events.CommitToTable;
-import org.apache.iceberg.connect.events.Event;
-import org.apache.iceberg.connect.events.StartCommit;
-import org.apache.iceberg.connect.events.TableReference;
+import org.apache.iceberg.data.GenericAppenderFactory;
+import org.apache.iceberg.data.GenericRecord;
+import org.apache.iceberg.data.Record;
 import org.apache.iceberg.exceptions.NoSuchTableException;
+import org.apache.iceberg.io.OutputFileFactory;
+import org.apache.iceberg.io.UnpartitionedWriter;
+import org.apache.iceberg.types.Types;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.util.Tasks;
 import org.apache.iceberg.util.ThreadPools;
+import org.apache.iceberg.connect.events.Event;
+import org.apache.iceberg.connect.events.StartCommit;
+import org.apache.iceberg.connect.events.CommitComplete;
+import org.apache.iceberg.connect.events.CommitToTable;
+import org.apache.iceberg.connect.events.TableReference;
 import org.apache.kafka.clients.admin.MemberDescription;
 import org.apache.kafka.connect.errors.ConnectException;
-import org.apache.kafka.connect.sink.SinkTaskContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -147,6 +155,10 @@ public class Coordinator extends Channel implements AutoCloseable {
 
     String offsetsJson = offsetsJson();
     OffsetDateTime vtts = commitState.vtts(partialCommit);
+    String db = null;
+    if (!commitMap.isEmpty()) {
+        db = commitMap.entrySet().iterator().next().getKey().namespace().toString();
+    }
 
     Tasks.foreach(commitMap.entrySet())
         .executeWith(exec)
@@ -164,6 +176,10 @@ public class Coordinator extends Channel implements AutoCloseable {
         new Event(config.controlGroupId(), new CommitComplete(commitState.currentCommitId(), vtts));
     send(event);
 
+    if (db != null) {
+      logWatermark(db);
+    }
+
     LOG.info(
         "Commit {} complete, committed to {} table(s), vtts {}",
         commitState.currentCommitId(),
@@ -176,6 +192,88 @@ public class Coordinator extends Channel implements AutoCloseable {
       return MAPPER.writeValueAsString(controlTopicOffsets());
     } catch (IOException e) {
       throw new UncheckedIOException(e);
+    }
+  }
+
+  private void logWatermark(String db) {
+    TableIdentifier watermarkTable = TableIdentifier.of("meta", "watermarks");
+    Table table;
+
+    try {
+        table = catalog.loadTable(watermarkTable);
+        LOG.debug("Found existing watermarks table");
+    } catch (NoSuchTableException e) {
+        LOG.info("Creating watermarks table in meta namespace");
+        org.apache.iceberg.Schema schema = new org.apache.iceberg.Schema(
+            Types.NestedField.required(1, "db", Types.StringType.get()),
+            Types.NestedField.required(2, "commit_start_time", Types.LongType.get()),
+            Types.NestedField.required(3, "commit_id", Types.StringType.get())
+        );
+
+        table = catalog.createTable(
+            watermarkTable,
+            schema,
+            PartitionSpec.unpartitioned(),
+            ImmutableMap.of()
+        );
+    }
+
+    UnpartitionedWriter<Record> writer = null;
+    try {
+        OutputFileFactory fileFactory = OutputFileFactory.builderFor(table, 1, System.currentTimeMillis())
+            .defaultSpec(table.spec())
+            .operationId(UUID.randomUUID().toString())
+            .format(FileFormat.PARQUET)
+            .build();
+
+        GenericAppenderFactory appenderFactory = new GenericAppenderFactory(table.schema());
+        writer = new UnpartitionedWriter<>(
+            table.spec(),
+            FileFormat.PARQUET,
+            appenderFactory,
+            fileFactory,
+            table.io(),
+            2*1024*1024
+        );
+
+        Record record = GenericRecord.create(table.schema());
+        record.setField("db", db);
+        record.setField("commit_start_time", commitState.getStartTime());
+        record.setField("commit_id", commitState.currentCommitId().toString());
+
+        writer.write(record);
+
+        // Get data files before closing
+        DataFile[] dataFiles = writer.dataFiles();
+        writer.close();
+
+        AppendFiles appendFiles = table.newAppend();
+        for (DataFile dataFile : dataFiles) {
+            appendFiles.appendFile(dataFile);
+        }
+        appendFiles.commit();
+
+        LOG.info("Successfully logged watermark for db={} commit_id={} commit_start_time={}",
+            db, commitState.currentCommitId(), commitState.getStartTime());
+
+    } catch (Exception e) {
+        LOG.error("Failed to write watermark for db={} commit_id={}",
+            db, commitState.currentCommitId(), e);
+        if (writer != null) {
+            try {
+                writer.abort();
+            } catch (IOException abortException) {
+                LOG.warn("Failed to abort writer", abortException);
+            }
+        }
+    } finally {
+        if (writer != null) {
+            try {
+                writer.close();
+            } catch (IOException e) {
+                LOG.warn("Failed to close writer", e);
+            }
+        }
     }
   }
 
