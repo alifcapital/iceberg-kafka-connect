@@ -196,30 +196,37 @@ public class Coordinator extends Channel implements AutoCloseable {
   }
 
   private void logWatermark(String db) {
-    TableIdentifier watermarkTable = TableIdentifier.of("meta", "watermarks");
-    Table table;
-
-    try {
-        table = catalog.loadTable(watermarkTable);
-        LOG.debug("Found existing watermarks table");
-    } catch (NoSuchTableException e) {
-        LOG.info("Creating watermarks table in meta namespace");
-        org.apache.iceberg.Schema schema = new org.apache.iceberg.Schema(
-            Types.NestedField.required(1, "db", Types.StringType.get()),
-            Types.NestedField.required(2, "commit_start_time", Types.LongType.get()),
-            Types.NestedField.required(3, "commit_id", Types.StringType.get())
-        );
-
-        table = catalog.createTable(
-            watermarkTable,
-            schema,
-            PartitionSpec.unpartitioned(),
-            ImmutableMap.of()
-        );
+    if (db == null) {
+        LOG.warn("No database name available, skipping watermark logging");
+        return;
     }
 
     UnpartitionedWriter<Record> writer = null;
+    boolean succeeded = false;
+
     try {
+        TableIdentifier watermarkTable = TableIdentifier.of("meta", "watermarks");
+        Table table;
+
+        try {
+            table = catalog.loadTable(watermarkTable);
+            LOG.debug("Found existing watermarks table");
+        } catch (NoSuchTableException e) {
+            LOG.info("Creating watermarks table in meta namespace");
+            org.apache.iceberg.Schema schema = new org.apache.iceberg.Schema(
+                Types.NestedField.required(1, "db", Types.StringType.get()),
+                Types.NestedField.required(2, "commit_start_time", Types.LongType.get()),
+                Types.NestedField.required(3, "commit_id", Types.StringType.get())
+            );
+
+            table = catalog.createTable(
+                watermarkTable,
+                schema,
+                PartitionSpec.unpartitioned(),
+                ImmutableMap.of()
+            );
+        }
+
         OutputFileFactory fileFactory = OutputFileFactory.builderFor(table, 1, System.currentTimeMillis())
             .defaultSpec(table.spec())
             .operationId(UUID.randomUUID().toString())
@@ -242,10 +249,9 @@ public class Coordinator extends Channel implements AutoCloseable {
         record.setField("commit_id", commitState.currentCommitId().toString());
 
         writer.write(record);
-
-        // Get data files before closing
         DataFile[] dataFiles = writer.dataFiles();
         writer.close();
+        writer = null;  // prevent double-cleanup in finally block
 
         AppendFiles appendFiles = table.newAppend();
         for (DataFile dataFile : dataFiles) {
@@ -253,25 +259,23 @@ public class Coordinator extends Channel implements AutoCloseable {
         }
         appendFiles.commit();
 
+        succeeded = true;
         LOG.info("Successfully logged watermark for db={} commit_id={} commit_start_time={}",
             db, commitState.currentCommitId(), commitState.getStartTime());
 
-    } catch (Exception e) {
+    } catch (Throwable t) {
         LOG.error("Failed to write watermark for db={} commit_id={}",
-            db, commitState.currentCommitId(), e);
-        if (writer != null) {
-            try {
-                writer.abort();
-            } catch (IOException abortException) {
-                LOG.warn("Failed to abort writer", abortException);
-            }
-        }
+            db, commitState.currentCommitId(), t);
     } finally {
         if (writer != null) {
             try {
-                writer.close();
+                if (succeeded) {
+                    writer.close();
+                } else {
+                    writer.abort();
+                }
             } catch (IOException e) {
-                LOG.warn("Failed to close writer", e);
+                LOG.warn("Failed to cleanup writer", e);
             }
         }
     }
