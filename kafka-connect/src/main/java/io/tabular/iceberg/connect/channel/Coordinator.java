@@ -61,6 +61,7 @@ import org.apache.iceberg.connect.events.Event;
 import org.apache.iceberg.connect.events.StartCommit;
 import org.apache.iceberg.connect.events.CommitComplete;
 import org.apache.iceberg.connect.events.CommitToTable;
+import org.apache.iceberg.connect.events.DataWritten;
 import org.apache.iceberg.connect.events.TableReference;
 import org.apache.kafka.clients.admin.MemberDescription;
 import org.apache.kafka.connect.errors.ConnectException;
@@ -153,7 +154,6 @@ public class Coordinator extends Channel implements AutoCloseable {
   private void doCommit(boolean partialCommit) {
     Map<TableIdentifier, List<Envelope>> commitMap = commitState.tableCommitMap();
 
-    String offsetsJson = offsetsJson();
     OffsetDateTime vtts = commitState.vtts(partialCommit);
     String db = null;
     if (!commitMap.isEmpty()) {
@@ -165,7 +165,7 @@ public class Coordinator extends Channel implements AutoCloseable {
         .stopOnFailure()
         .run(
             entry -> {
-              commitToTable(entry.getKey(), entry.getValue(), offsetsJson, vtts);
+              commitToTable(entry.getKey(), entry.getValue(), vtts);
             });
 
     // we should only get here if all tables committed successfully...
@@ -185,14 +185,6 @@ public class Coordinator extends Channel implements AutoCloseable {
         commitState.currentCommitId(),
         commitMap.size(),
         vtts);
-  }
-
-  private String offsetsJson() {
-    try {
-      return MAPPER.writeValueAsString(controlTopicOffsets());
-    } catch (IOException e) {
-      throw new UncheckedIOException(e);
-    }
   }
 
   private void logWatermark(String db) {
@@ -284,7 +276,6 @@ public class Coordinator extends Channel implements AutoCloseable {
   private void commitToTable(
       TableIdentifier tableIdentifier,
       List<Envelope> envelopeList,
-      String offsetsJson,
       OffsetDateTime vtts) {
     Table table;
     try {
@@ -296,14 +287,27 @@ public class Coordinator extends Channel implements AutoCloseable {
 
     Optional<String> branch = config.tableConfig(tableIdentifier.toString()).commitBranch();
 
-    Map<Integer, Long> committedOffsets = lastCommittedOffsetsForTable(table, branch.orElse(null));
+    CommittedInfo committedInfo = lastCommittedInfo(table, branch.orElse(null));
+    UUID lastCommittedCommit = committedInfo.commitId;
+    Map<Integer, Long> lastCommittedOffsets = committedInfo.offsets;
 
     List<Envelope> filteredEnvelopeList =
         envelopeList.stream()
             .filter(
                 envelope -> {
-                  Long minOffset = committedOffsets.get(envelope.partition());
-                  return minOffset == null || envelope.offset() >= minOffset;
+                    DataWritten payload = (DataWritten) envelope.event().payload();
+                    UUID payloadCommitId = payload.commitId();
+
+                    if (payloadCommitId.version() != 7) {
+                        // Use old offset-based logic for v4 UUIDs
+                        Long minOffset = lastCommittedOffsets.get(envelope.partition());
+                        return minOffset == null || envelope.offset() >= minOffset;
+                    }
+
+                    // For v7 UUIDs, compare with lastCommittedCommit if it exists and is v7
+                    return lastCommittedCommit == null ||
+                          lastCommittedCommit.version() != 7 ||
+                          payloadCommitId.compareTo(lastCommittedCommit) > 0;
                 })
             .collect(toList());
 
@@ -343,7 +347,6 @@ public class Coordinator extends Channel implements AutoCloseable {
           list.get(i).forEach(appendOp::appendFile);
           appendOp.set(COMMIT_ID_SNAPSHOT_PROP, commitState.currentCommitId().toString());
           if (i == lastIdx) {
-            appendOp.set(snapshotOffsetsProp, offsetsJson);
             if (vtts != null) {
               appendOp.set(VTTS_SNAPSHOT_PROP, Long.toString(vtts.toInstant().toEpochMilli()));
             }
@@ -356,7 +359,6 @@ public class Coordinator extends Channel implements AutoCloseable {
       } else {
         RowDelta deltaOp = table.newRowDelta();
         branch.ifPresent(deltaOp::toBranch);
-        deltaOp.set(snapshotOffsetsProp, offsetsJson);
         deltaOp.set(COMMIT_ID_SNAPSHOT_PROP, commitState.currentCommitId().toString());
         if (vtts != null) {
           deltaOp.set(VTTS_SNAPSHOT_PROP, Long.toString(vtts.toInstant().toEpochMilli()));
@@ -393,23 +395,41 @@ public class Coordinator extends Channel implements AutoCloseable {
     return table.snapshot(branch);
   }
 
-  private Map<Integer, Long> lastCommittedOffsetsForTable(Table table, String branch) {
+  private static class CommittedInfo {
+    final UUID commitId;
+    final Map<Integer, Long> offsets;
+
+    CommittedInfo(UUID commitId, Map<Integer, Long> offsets) {
+        this.commitId = commitId;
+        this.offsets = offsets;
+    }
+  }
+
+  private CommittedInfo lastCommittedInfo(Table table, String branch) {
     Snapshot snapshot = latestSnapshot(table, branch);
     while (snapshot != null) {
-      Map<String, String> summary = snapshot.summary();
-      String value = summary.get(snapshotOffsetsProp);
-      if (value != null) {
-        TypeReference<Map<Integer, Long>> typeRef = new TypeReference<Map<Integer, Long>>() {};
-        try {
-          return MAPPER.readValue(value, typeRef);
-        } catch (IOException e) {
-          throw new UncheckedIOException(e);
+        Map<String, String> summary = snapshot.summary();
+        String commitIdValue = summary.get(COMMIT_ID_SNAPSHOT_PROP);
+        String offsetsValue = summary.get(snapshotOffsetsProp);
+
+        if (commitIdValue != null || offsetsValue != null) {
+            UUID commitId = commitIdValue != null ? UUID.fromString(commitIdValue) : null;
+            Map<Integer, Long> offsets = ImmutableMap.of();
+            if (offsetsValue != null) {
+                try {
+                    TypeReference<Map<Integer, Long>> typeRef = new TypeReference<Map<Integer, Long>>() {};
+                    offsets = MAPPER.readValue(offsetsValue, typeRef);
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+            }
+            return new CommittedInfo(commitId, offsets);
         }
-      }
-      Long parentSnapshotId = snapshot.parentId();
-      snapshot = parentSnapshotId != null ? table.snapshot(parentSnapshotId) : null;
+
+        Long parentSnapshotId = snapshot.parentId();
+        snapshot = parentSnapshotId != null ? table.snapshot(parentSnapshotId) : null;
     }
-    return ImmutableMap.of();
+    return new CommittedInfo(null, ImmutableMap.of());
   }
 
   @Override

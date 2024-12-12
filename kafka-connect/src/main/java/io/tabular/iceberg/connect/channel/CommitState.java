@@ -20,6 +20,7 @@ package io.tabular.iceberg.connect.channel;
 
 import static java.util.stream.Collectors.groupingBy;
 
+import io.tabular.iceberg.connect.channel.UUIDv7;
 import io.tabular.iceberg.connect.IcebergSinkConfig;
 import java.time.OffsetDateTime;
 import java.util.Comparator;
@@ -92,7 +93,7 @@ public class CommitState {
   }
 
   public void startNewCommit() {
-    currentCommitId = UUID.randomUUID();
+    currentCommitId = UUIDv7.randomUUID();
     startTime = System.currentTimeMillis();
   }
 
