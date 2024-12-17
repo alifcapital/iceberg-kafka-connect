@@ -30,10 +30,13 @@ import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Optional;
 import java.util.UUID;
+import org.apache.iceberg.FileContent;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.connect.events.DataComplete;
 import org.apache.iceberg.connect.events.DataWritten;
 import org.apache.iceberg.connect.events.TopicPartitionOffset;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -147,14 +150,57 @@ public class CommitState {
     return false;
   }
 
-  public Map<TableIdentifier, List<Envelope>> tableCommitMap() {
-    return commitBuffer.stream()
-        .collect(
-            groupingBy(
-                envelope ->
-                    ((DataWritten) envelope.event().payload())
-                        .tableReference()
-                        .identifier()));
+  /**
+   * Tokenize the input envelope list when we get an envelope with an Equality Delete File. This
+   * will make sure that one commit will have at max one Envelope with Equality Delete. Used to
+   * handle iceberg commit issues arising from multiple envelopes having CDC records of the same
+   * original record.If an equality delete in Envelope E1 has a corresponding Insert record in E0 we
+   * don't want them to be part of same commit because in Iceberg, an Equality delete D1's range for
+   * finding insert records is commits which are strictly earlier than the commit of D1.
+   *
+   * @param list Envelope List
+   * @return List of Envelope Lists
+   */
+  public List<List<Envelope>> tokenize(List<Envelope> list) {
+    List<List<Envelope>> tokenized = Lists.newArrayList();
+    List<Envelope> tempList = new LinkedList<>();
+    list.forEach(
+        envelope -> {
+          boolean checkEqualityDeletes =
+              ((DataWritten) envelope.event().payload())
+                  .deleteFiles().stream()
+                      .anyMatch(x -> x.content() == FileContent.EQUALITY_DELETES);
+          if (checkEqualityDeletes) {
+            // create a list containing only one envelope having eq delete files
+            if (!tempList.isEmpty()) {
+              tokenized.add(List.copyOf(tempList));
+              tempList.clear();
+            }
+            tempList.add(envelope);
+            tokenized.add(List.copyOf(tempList));
+            tempList.clear();
+            return;
+          }
+          tempList.add(envelope);
+        });
+    if (!tempList.isEmpty()) {
+      tokenized.add(List.copyOf(tempList));
+    }
+    return tokenized;
+  }
+
+  public Map<TableIdentifier, List<List<Envelope>>> tableCommitMap() {
+    Map<TableIdentifier, List<Envelope>> tempCommitMap =
+        commitBuffer.stream()
+            .collect(
+                groupingBy(
+                    envelope ->
+                      ((DataWritten) envelope.event().payload())
+                          .tableReference()
+                          .identifier()));
+    Map<TableIdentifier, List<List<Envelope>>> commitMap = Maps.newHashMap();
+    tempCommitMap.forEach((k, v) -> commitMap.put(k, tokenize(v)));
+    return commitMap;
   }
 
   public OffsetDateTime vtts(boolean partialCommit) {

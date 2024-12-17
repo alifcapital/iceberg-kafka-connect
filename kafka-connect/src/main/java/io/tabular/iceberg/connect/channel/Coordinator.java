@@ -18,7 +18,9 @@
  */
 package io.tabular.iceberg.connect.channel;
 
+import static java.util.stream.Collectors.groupingBy;
 import static java.util.stream.Collectors.toList;
+import static java.util.stream.Collectors.toMap;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -55,6 +57,8 @@ import org.apache.iceberg.io.UnpartitionedWriter;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.iceberg.util.Pair;
 import org.apache.iceberg.util.Tasks;
 import org.apache.iceberg.util.ThreadPools;
 import org.apache.iceberg.connect.events.Event;
@@ -152,7 +156,7 @@ public class Coordinator extends Channel implements AutoCloseable {
   }
 
   private void doCommit(boolean partialCommit) {
-    Map<TableIdentifier, List<Envelope>> commitMap = commitState.tableCommitMap();
+    Map<TableIdentifier, List<List<Envelope>>> commitMap = commitState.tableCommitMap();
 
     OffsetDateTime vtts = commitState.vtts(partialCommit);
     String db = null;
@@ -165,7 +169,7 @@ public class Coordinator extends Channel implements AutoCloseable {
         .stopOnFailure()
         .run(
             entry -> {
-              commitToTable(entry.getKey(), entry.getValue(), vtts);
+              commitToTableBatch(entry.getKey(), entry.getValue(), vtts);
             });
 
     // we should only get here if all tables committed successfully...
@@ -176,7 +180,7 @@ public class Coordinator extends Channel implements AutoCloseable {
         new Event(config.controlGroupId(), new CommitComplete(commitState.currentCommitId(), vtts));
     send(event);
 
-    if (db != null) {
+    if (db != null && !partialCommit) {
       logWatermark(db);
     }
 
@@ -273,43 +277,107 @@ public class Coordinator extends Channel implements AutoCloseable {
     }
   }
 
-  private void commitToTable(
-      TableIdentifier tableIdentifier,
-      List<Envelope> envelopeList,
-      OffsetDateTime vtts) {
+  private Pair<Table, Optional<String>> getTableAndBranch(TableIdentifier tableIdentifier) {
     Table table;
     try {
       table = catalog.loadTable(tableIdentifier);
+      Optional<String> branch = config.tableConfig(tableIdentifier.toString()).commitBranch();
+      return Pair.of(table, branch);
     } catch (NoSuchTableException e) {
       LOG.warn("Table not found, skipping commit: {}", tableIdentifier);
-      return;
+      return null;
     }
+  }
 
-    Optional<String> branch = config.tableConfig(tableIdentifier.toString()).commitBranch();
+  /**
+   * This method takes the tokenized Envelope list and calls commitToTable for each batch. In each
+   * batch(except the last one) the maxOffset of the last Envelope in the List is resolved with the
+   * offset committed in the previous commit and committed to the snapshot summary. The last batch
+   * takes the offsetJson from the control topic and commits it.
+   *
+   * @param tableIdentifier Iceberg TableIdentifier
+   * @param tokenizedEnvelopeList Tokenized Envelop List of Events
+   * @param offsetsJson offsetsJson from control topic
+   * @param vtts valid-through timestamp
+   */
+  private void commitToTableBatch(
+      TableIdentifier tableIdentifier,
+      List<List<Envelope>> tokenizedEnvelopeList,
+      OffsetDateTime vtts) {
+    Pair<Table, Optional<String>> tableBranch = getTableAndBranch(tableIdentifier);
+    if (tableBranch != null) {
+      for (int i = 0; i < tokenizedEnvelopeList.size(); i++) {
+        List<Envelope> envelopeList = tokenizedEnvelopeList.get(i);
+        commitToTable(
+            tableIdentifier,
+            tableBranch,
+            envelopeList,
+            vtts);
+      }
+  }
+}
+
+  private void commitToTable(
+      TableIdentifier tableIdentifier,
+      Pair<Table, Optional<String>> tableBranch,
+      List<Envelope> envelopeList,
+      OffsetDateTime vtts) {
+    Table table;
+    if (tableBranch == null) {
+      return;
+    } else {
+      table = tableBranch.first();
+    }
+    Optional<String> branch = tableBranch.second();
 
     CommittedInfo committedInfo = lastCommittedInfo(table, branch.orElse(null));
     UUID lastCommittedCommit = committedInfo.commitId;
     Map<Integer, Long> lastCommittedOffsets = committedInfo.offsets;
 
-    List<Envelope> filteredEnvelopeList =
-        envelopeList.stream()
-            .filter(
-                envelope -> {
-                    DataWritten payload = (DataWritten) envelope.event().payload();
-                    UUID payloadCommitId = payload.commitId();
+    List<Envelope> filteredEnvelopeList = envelopeList.stream()
+    .filter(envelope -> {
+        DataWritten payload = (DataWritten) envelope.event().payload();
+        UUID payloadCommitId = payload.commitId();
+        Long minOffset = lastCommittedOffsets.get(envelope.partition());
 
-                    if (payloadCommitId.version() != 7) {
-                        // Use old offset-based logic for v4 UUIDs
-                        Long minOffset = lastCommittedOffsets.get(envelope.partition());
-                        return minOffset == null || envelope.offset() >= minOffset;
-                    }
+        if (lastCommittedCommit == null || lastCommittedCommit.version() != 7) {
+          // For non-v7 UUIDs, use offset comparison
+          return minOffset == null || envelope.offset() >= minOffset;
+        } else {
+          // For v7 UUIDs:
+          int commitComparison = payloadCommitId.compareTo(lastCommittedCommit);
+          if (commitComparison > 0) {
+              // Newer commit - process regardless of offset
+              return true;
+          } else if (commitComparison == 0) {
+              // Same commit - check offset
+              return minOffset == null || envelope.offset() >= minOffset;
+          } else {
+              // Older commit - skip
+              return false;
+          }
+        }
+        })
+    .collect(toList());
 
-                    // For v7 UUIDs, compare with lastCommittedCommit if it exists and is v7
-                    return lastCommittedCommit == null ||
-                          lastCommittedCommit.version() != 7 ||
-                          payloadCommitId.compareTo(lastCommittedCommit) > 0;
-                })
-            .collect(toList());
+    Map<Integer, Long> offsetMap = filteredEnvelopeList.stream()
+    .collect(groupingBy(
+        Envelope::partition,
+        Collectors.mapping(
+            Envelope::offset,
+            Collectors.maxBy(Long::compareTo))
+    )).entrySet().stream()
+    .collect(toMap(
+        Map.Entry::getKey,
+        e -> e.getValue().get()
+    ));
+
+    String offsetsJson;
+    try {
+        offsetsJson = MAPPER.writeValueAsString(offsetMap);
+    } catch (IOException e) {
+        throw new UncheckedIOException(e);
+    }
 
     List<DataFile> dataFiles =
         Deduplicated.dataFiles(commitState.currentCommitId(), tableIdentifier, filteredEnvelopeList)
@@ -347,6 +415,7 @@ public class Coordinator extends Channel implements AutoCloseable {
           list.get(i).forEach(appendOp::appendFile);
           appendOp.set(COMMIT_ID_SNAPSHOT_PROP, commitState.currentCommitId().toString());
           if (i == lastIdx) {
+            appendOp.set(snapshotOffsetsProp, offsetsJson);
             if (vtts != null) {
               appendOp.set(VTTS_SNAPSHOT_PROP, Long.toString(vtts.toInstant().toEpochMilli()));
             }
@@ -359,6 +428,7 @@ public class Coordinator extends Channel implements AutoCloseable {
       } else {
         RowDelta deltaOp = table.newRowDelta();
         branch.ifPresent(deltaOp::toBranch);
+        deltaOp.set(snapshotOffsetsProp, offsetsJson);
         deltaOp.set(COMMIT_ID_SNAPSHOT_PROP, commitState.currentCommitId().toString());
         if (vtts != null) {
           deltaOp.set(VTTS_SNAPSHOT_PROP, Long.toString(vtts.toInstant().toEpochMilli()));

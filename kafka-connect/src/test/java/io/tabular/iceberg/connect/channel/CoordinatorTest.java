@@ -234,11 +234,11 @@ public class CoordinatorTest extends ChannelTestBase {
                           ImmutableList.of(new TopicPartitionOffset("topic", 1, 1L, ts)))));
             });
 
-    assertCommitTable(1, commitId, ts);
-    assertCommitComplete(2, commitId, ts);
+    assertCommitTable(2, commitId, ts);
+    assertCommitComplete(3, commitId, ts);
 
     List<Snapshot> snapshots = ImmutableList.copyOf(table.snapshots());
-    Assertions.assertEquals(1, snapshots.size());
+    Assertions.assertEquals(2, snapshots.size()); // tokenized due to Equality Deletes
 
     Snapshot snapshot = snapshots.get(0);
     Assertions.assertEquals(DataOperations.OVERWRITE, snapshot.operation());
