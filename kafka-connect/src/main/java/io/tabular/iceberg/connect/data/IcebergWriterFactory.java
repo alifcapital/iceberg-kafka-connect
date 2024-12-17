@@ -82,7 +82,7 @@ public class IcebergWriterFactory {
 
       org.apache.iceberg.Schema schema;
 
-      if (config.tablesCdcField() != null && config.upsertModeEnabled()) {
+      if (config.tablesCdcField() != null || config.upsertModeEnabled()) {
         Set<Integer> equalityFieldIds = Set.of();
         // Get PK from Kafka topic key
         if (sample.keySchema() != null) {
