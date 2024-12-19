@@ -335,30 +335,11 @@ public class Coordinator extends Channel implements AutoCloseable {
     Map<Integer, Long> lastCommittedOffsets = committedInfo.offsets;
 
     List<Envelope> filteredEnvelopeList = envelopeList.stream()
-    .filter(envelope -> {
-        DataWritten payload = (DataWritten) envelope.event().payload();
-        UUID payloadCommitId = payload.commitId();
+      .filter(envelope -> {
         Long minOffset = lastCommittedOffsets.get(envelope.partition());
-
-        if (lastCommittedCommit == null || lastCommittedCommit.version() != 7) {
-          // For non-v7 UUIDs, use offset comparison
-          return minOffset == null || envelope.offset() >= minOffset;
-        } else {
-          // For v7 UUIDs:
-          int commitComparison = payloadCommitId.compareTo(lastCommittedCommit);
-          if (commitComparison > 0) {
-              // Newer commit - process regardless of offset
-              return true;
-          } else if (commitComparison == 0) {
-              // Same commit - check offset
-              return minOffset == null || envelope.offset() >= minOffset;
-          } else {
-              // Older commit - skip
-              return false;
-          }
-        }
-        })
-    .collect(toList());
+        return minOffset == null || envelope.offset() >= minOffset;
+      })
+      .collect(toList());
 
     Map<Integer, Long> offsetMap = filteredEnvelopeList.stream()
     .collect(groupingBy(
