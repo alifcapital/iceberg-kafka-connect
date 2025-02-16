@@ -20,7 +20,9 @@ package io.tabular.iceberg.connect.data;
 
 import static java.util.stream.Collectors.toSet;
 import io.tabular.iceberg.connect.IcebergSinkConfig;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.iceberg.PartitionSpec;
@@ -81,6 +83,7 @@ public class IcebergWriterFactory {
       }
 
       org.apache.iceberg.Schema schema;
+      Map<String, String> tableProperties = new HashMap<>(config.autoCreateProps());
 
       if (config.tablesCdcField() != null || config.upsertModeEnabled()) {
         Set<Integer> equalityFieldIds = Set.of();
@@ -101,6 +104,16 @@ public class IcebergWriterFactory {
         }
 
         schema = new org.apache.iceberg.Schema(structType.fields(), equalityFieldIds);
+
+        if (!equalityFieldIds.isEmpty()) {
+            for (Integer fieldId : equalityFieldIds) {
+                String fieldName = schema.findColumnName(fieldId);
+                tableProperties.put(
+                    "write.parquet.bloom.filter.enabled.column." + fieldName,
+                    "true"
+                );
+            }
+        }
       } else {
         schema = new org.apache.iceberg.Schema(structType.fields());
       }
@@ -130,7 +143,7 @@ public class IcebergWriterFactory {
                         } catch (NoSuchTableException e) {
                           result.set(
                                   catalog.createTable(
-                                          identifier, schema, partitionSpec, config.autoCreateProps()));
+                                          identifier, schema, partitionSpec, tableProperties));
                           LOG.info("Created new table {} from record at topic: {}, partition: {}, offset: {}", identifier, sample.topic(), sample.kafkaPartition(), sample.kafkaOffset());
                         }
                       });
