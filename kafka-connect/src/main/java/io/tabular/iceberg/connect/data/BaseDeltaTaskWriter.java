@@ -25,6 +25,7 @@ import org.apache.iceberg.PartitionKey;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.StructLike;
+import org.apache.iceberg.deletes.DeleteGranularity;
 import org.apache.iceberg.data.InternalRecordWrapper;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.io.BaseTaskWriter;
@@ -91,8 +92,8 @@ abstract class BaseDeltaTaskWriter extends BaseTaskWriter<Record> {
   class RowDataDeltaWriter extends BaseEqualityDeltaWriter {
 
     RowDataDeltaWriter(PartitionKey partition) {
-      super(partition, schema, deleteSchema);
-    }
+      super(partition, schema, deleteSchema, DeleteGranularity.FILE);
+  }
 
     @Override
     protected StructLike asStructLike(Record data) {
