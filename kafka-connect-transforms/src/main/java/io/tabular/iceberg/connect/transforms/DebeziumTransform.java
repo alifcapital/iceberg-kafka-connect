@@ -75,7 +75,11 @@ public class DebeziumTransform<R extends ConnectRecord<R>> implements Transforma
   private R applyWithSchema(R record) {
     Struct value = Requirements.requireStruct(record.value(), "Debezium transform");
 
-    String op = mapOperation(value.get("op").toString());
+    String op = value.get("op").toString();
+    if ("m".equals(op)) {
+      return null; // Skip message events
+    }
+    op = mapOperation(op);
 
     Struct payload;
     Schema payloadSchema;
@@ -128,7 +132,11 @@ public class DebeziumTransform<R extends ConnectRecord<R>> implements Transforma
   private R applySchemaless(R record) {
     Map<String, Object> value = Requirements.requireMap(record.value(), "Debezium transform");
 
-    String op = mapOperation(value.get("op").toString());
+    String op = value.get("op").toString();
+    if ("m".equals(op)) {
+      return null; // Skip message events
+    }
+    op = mapOperation(op);
 
     Object payload;
     if (op.equals(CdcConstants.OP_DELETE)) {
@@ -175,6 +183,8 @@ public class DebeziumTransform<R extends ConnectRecord<R>> implements Transforma
         return CdcConstants.OP_UPDATE;
       case "d":
         return CdcConstants.OP_DELETE;
+      case "m":
+        return null; // Message events are skipped
       default:
         // Debezium ops "c", "r", and any others
         return CdcConstants.OP_INSERT;
