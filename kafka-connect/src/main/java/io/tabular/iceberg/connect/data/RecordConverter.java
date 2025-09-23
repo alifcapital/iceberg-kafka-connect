@@ -42,6 +42,7 @@ import java.util.Date;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
@@ -80,12 +81,14 @@ public class RecordConverter {
   private final Schema tableSchema;
   private final NameMapping nameMapping;
   private final IcebergSinkConfig config;
+  private final Set<Integer> identifierFieldIds;
   private final Map<Integer, Map<String, NestedField>> structNameMap = Maps.newHashMap();
 
   public RecordConverter(Table table, IcebergSinkConfig config) {
     this.tableSchema = table.schema();
     this.nameMapping = createNameMapping(table);
     this.config = config;
+    this.identifierFieldIds = table.schema().identifierFieldIds();
   }
 
   public Record convert(Object data) {
@@ -168,6 +171,11 @@ public class RecordConverter {
       for (NestedField tableField : schema.fields()) {
         if (tableField.isRequired()) {
           if (!map.containsKey(tableField.name())) {
+            // Don't make identifier fields optional
+            if (identifierFieldIds != null && identifierFieldIds.contains(tableField.fieldId())) {
+              // Skip making identifier fields optional - they must remain required
+              continue;
+            }
             String fieldName = tableSchema.findColumnName(tableField.fieldId());
             schemaUpdateConsumer.makeOptional(fieldName);
           }
@@ -216,6 +224,10 @@ public class RecordConverter {
         if (tableField.isRequired()) {
           Field recordField = struct.schema().field(tableField.name());
           if (recordField == null) {
+            // Don't make identifier fields optional
+            if (identifierFieldIds != null && identifierFieldIds.contains(tableField.fieldId())) {
+              continue;
+            }
             hasSchemaUpdates = true;
             String fieldName = tableSchema.findColumnName(tableField.fieldId());
             schemaUpdateConsumer.makeOptional(fieldName);
@@ -249,9 +261,13 @@ public class RecordConverter {
 
           // make optional if needed and schema evolution is on
           if (tableField.isRequired() && recordField.schema().isOptional()) {
-            String fieldName = tableSchema.findColumnName(tableField.fieldId());
-            schemaUpdateConsumer.makeOptional(fieldName);
-            hasSchemaUpdates = true;
+            // Don't make identifier fields optional
+            if (identifierFieldIds != null && identifierFieldIds.contains(tableField.fieldId())) {
+            } else {
+              String fieldName = tableSchema.findColumnName(tableField.fieldId());
+              schemaUpdateConsumer.makeOptional(fieldName);
+              hasSchemaUpdates = true;
+            }
           }
         }
 
