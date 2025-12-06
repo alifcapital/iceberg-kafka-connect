@@ -149,6 +149,9 @@ public class IcebergWriter implements RecordWriter {
   @Override
   public synchronized List<WriterResult> complete() {
     flush();
+    // Start a fresh writer so subsequent batches do not accumulate references
+    // to data files from previous batches, which would bloat delete metadata.
+    initNewWriter();
 
     List<WriterResult> result = Lists.newArrayList(writerResults);
     writerResults.clear();

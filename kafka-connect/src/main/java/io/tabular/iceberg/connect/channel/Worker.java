@@ -64,6 +64,8 @@ class Worker implements Writer, AutoCloseable {
   public Committable committable() {
     List<WriterResult> writeResults =
         writers.values().stream().flatMap(writer -> writer.complete().stream()).collect(toList());
+    // close writers for this commit cycle before dropping references
+    writers.values().forEach(RecordWriter::close);
     Map<TopicPartition, Offset> offsets = Maps.newHashMap(sourceOffsets);
 
     writers.clear();
