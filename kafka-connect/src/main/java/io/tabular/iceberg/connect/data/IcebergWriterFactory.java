@@ -108,9 +108,15 @@ public class IcebergWriterFactory {
         if (!equalityFieldIds.isEmpty()) {
             for (Integer fieldId : equalityFieldIds) {
                 String fieldName = schema.findColumnName(fieldId);
+                // Enable bloom filter for faster equality lookups
                 tableProperties.put(
-                    "write.parquet.bloom.filter.enabled.column." + fieldName,
+                    "write.parquet.bloom-filter-enabled.column." + fieldName,
                     "true"
+                );
+                // Use full metrics (no truncation) for proper equality delete file indexing
+                tableProperties.put(
+                    "write.metadata.metrics.column." + fieldName,
+                    "full"
                 );
             }
         }

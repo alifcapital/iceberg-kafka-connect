@@ -159,14 +159,28 @@ public class Utilities {
     Map<String, String> tableProps = Maps.newHashMap(table.properties());
     tableProps.putAll(config.writeProps());
 
+    Set<Integer> identifierFieldIds = table.schema().identifierFieldIds();
+
+    // Use full metrics for file_path to enable proper position delete file indexing.
+    // Without this, truncated bounds cause pos-delete files to be assigned to all data files.
+    tableProps.putIfAbsent("write.metadata.metrics.column.file_path", "full");
+
+    // Use full metrics for identifier fields to enable proper equality delete file indexing.
+    if (identifierFieldIds != null && !identifierFieldIds.isEmpty()) {
+      for (Integer fieldId : identifierFieldIds) {
+        String fieldName = table.schema().findColumnName(fieldId);
+        if (fieldName != null) {
+          tableProps.putIfAbsent("write.metadata.metrics.column." + fieldName, "full");
+        }
+      }
+    }
+
     String formatStr = tableProps.getOrDefault(DEFAULT_FILE_FORMAT, DEFAULT_FILE_FORMAT_DEFAULT);
     FileFormat format = FileFormat.valueOf(formatStr.toUpperCase());
 
     long targetFileSize =
         PropertyUtil.propertyAsLong(
             tableProps, WRITE_TARGET_FILE_SIZE_BYTES, WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT);
-
-    Set<Integer> identifierFieldIds = table.schema().identifierFieldIds();
 
     FileAppenderFactory<Record> appenderFactory;
     if (identifierFieldIds == null || identifierFieldIds.isEmpty()) {
