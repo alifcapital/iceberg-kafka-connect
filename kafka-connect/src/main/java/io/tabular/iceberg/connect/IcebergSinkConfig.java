@@ -57,6 +57,7 @@ public class IcebergSinkConfig extends AbstractConfig {
   private static final String ID_COLUMNS = "id-columns";
   private static final String PARTITION_BY = "partition-by";
   private static final String COMMIT_BRANCH = "commit-branch";
+  private static final String APPEND_ONLY = "append-only";
 
   private static final String CATALOG_PROP_PREFIX = "iceberg.catalog.";
   private static final String HADOOP_PROP_PREFIX = "iceberg.hadoop.";
@@ -369,7 +370,10 @@ public class IcebergSinkConfig extends AbstractConfig {
           String commitBranch =
               tableConfig.getOrDefault(COMMIT_BRANCH, tablesDefaultCommitBranch());
 
-          return new TableSinkConfig(routeRegex, idColumns, partitionBy, commitBranch);
+          boolean appendOnly =
+              Boolean.parseBoolean(tableConfig.getOrDefault(APPEND_ONLY, "false"));
+
+          return new TableSinkConfig(routeRegex, idColumns, partitionBy, commitBranch, appendOnly);
         });
   }
 

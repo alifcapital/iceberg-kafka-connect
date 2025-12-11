@@ -207,8 +207,12 @@ public class Utilities {
             .build();
 
     TaskWriter<Record> writer;
+    boolean appendOnly = config.tableConfig(tableName).appendOnly();
+    boolean useDeltaWriter =
+        !appendOnly && (config.tablesCdcField() != null || config.upsertModeEnabled());
+
     if (table.spec().isUnpartitioned()) {
-      if (config.tablesCdcField() == null && !config.upsertModeEnabled()) {
+      if (!useDeltaWriter) {
         writer =
             new UnpartitionedWriter<>(
                 table.spec(), format, appenderFactory, fileFactory, table.io(), targetFileSize);
@@ -226,7 +230,7 @@ public class Utilities {
                 config.upsertModeEnabled());
       }
     } else {
-      if (config.tablesCdcField() == null && !config.upsertModeEnabled()) {
+      if (!useDeltaWriter) {
         writer =
             new PartitionedAppendWriter(
                 table.spec(),

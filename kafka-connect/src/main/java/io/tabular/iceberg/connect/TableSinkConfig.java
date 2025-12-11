@@ -28,13 +28,19 @@ public class TableSinkConfig {
   private final List<String> idColumns;
   private final List<String> partitionBy;
   private final String commitBranch;
+  private final boolean appendOnly;
 
   public TableSinkConfig(
-      Pattern routeRegex, List<String> idColumns, List<String> partitionBy, String commitBranch) {
+      Pattern routeRegex,
+      List<String> idColumns,
+      List<String> partitionBy,
+      String commitBranch,
+      boolean appendOnly) {
     this.routeRegex = routeRegex;
     this.idColumns = idColumns;
     this.partitionBy = partitionBy;
     this.commitBranch = commitBranch;
+    this.appendOnly = appendOnly;
   }
 
   public Optional<Pattern> routeRegex() {
@@ -51,5 +57,9 @@ public class TableSinkConfig {
 
   public Optional<String> commitBranch() {
     return Optional.ofNullable(commitBranch);
+  }
+
+  public boolean appendOnly() {
+    return appendOnly;
   }
 }
