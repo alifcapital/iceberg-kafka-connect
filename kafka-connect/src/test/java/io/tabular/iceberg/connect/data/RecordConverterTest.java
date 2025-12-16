@@ -862,6 +862,126 @@ public class RecordConverterTest {
     assertThat(makeOptionals.iterator().next().name()).isEqualTo("a.j");
   }
 
+  @Test
+  public void testDebeziumMicroTimestampConversion() {
+    Table table = mock(Table.class);
+    when(table.schema()).thenReturn(SIMPLE_SCHEMA);
+    RecordConverter converter = new RecordConverter(table, config);
+
+    // MicroTimestamp value: microseconds since epoch
+    // 2023-05-18T11:22:33Z in microseconds
+    long microsValue = 1684409553000000L;
+    LocalDateTime expected = LocalDateTime.parse("2023-05-18T11:22:33");
+
+    Temporal result =
+        converter.convertTimestampValue(
+            microsValue, TimestampType.withoutZone(), "io.debezium.time.MicroTimestamp");
+    assertThat(result).isEqualTo(expected);
+  }
+
+  @Test
+  public void testDebeziumNanoTimestampConversion() {
+    Table table = mock(Table.class);
+    when(table.schema()).thenReturn(SIMPLE_SCHEMA);
+    RecordConverter converter = new RecordConverter(table, config);
+
+    // NanoTimestamp value: nanoseconds since epoch
+    // 2023-05-18T11:22:33Z in nanoseconds
+    long nanosValue = 1684409553000000000L;
+    LocalDateTime expected = LocalDateTime.parse("2023-05-18T11:22:33");
+
+    Temporal result =
+        converter.convertTimestampValue(
+            nanosValue, TimestampType.withoutZone(), "io.debezium.time.NanoTimestamp");
+    assertThat(result).isEqualTo(expected);
+  }
+
+  @Test
+  public void testDebeziumTimestampConversion() {
+    Table table = mock(Table.class);
+    when(table.schema()).thenReturn(SIMPLE_SCHEMA);
+    RecordConverter converter = new RecordConverter(table, config);
+
+    // Timestamp value: milliseconds since epoch
+    long millisValue = 1684409553000L;
+    LocalDateTime expected = LocalDateTime.parse("2023-05-18T11:22:33");
+
+    Temporal result =
+        converter.convertTimestampValue(
+            millisValue, TimestampType.withoutZone(), "io.debezium.time.Timestamp");
+    assertThat(result).isEqualTo(expected);
+  }
+
+  @Test
+  public void testDebeziumZonedTimestampConversion() {
+    Table table = mock(Table.class);
+    when(table.schema()).thenReturn(SIMPLE_SCHEMA);
+    RecordConverter converter = new RecordConverter(table, config);
+
+    // ZonedTimestamp value: ISO 8601 string with timezone
+    String isoValue = "2023-05-18T11:22:33.123456Z";
+    OffsetDateTime expected = OffsetDateTime.parse("2023-05-18T11:22:33.123456Z");
+
+    Temporal result =
+        converter.convertTimestampValue(
+            isoValue, TimestampType.withZone(), "io.debezium.time.ZonedTimestamp");
+    assertThat(result).isEqualTo(expected);
+
+    // Test with non-UTC offset
+    String isoValueWithOffset = "2023-05-18T13:22:33.123456+02:00";
+    OffsetDateTime expectedWithOffset = OffsetDateTime.parse("2023-05-18T13:22:33.123456+02:00");
+
+    Temporal resultWithOffset =
+        converter.convertTimestampValue(
+            isoValueWithOffset, TimestampType.withZone(), "io.debezium.time.ZonedTimestamp");
+    assertThat(resultWithOffset).isEqualTo(expectedWithOffset);
+  }
+
+  @Test
+  public void testDebeziumMicroTimeConversion() {
+    Table table = mock(Table.class);
+    when(table.schema()).thenReturn(SIMPLE_SCHEMA);
+    RecordConverter converter = new RecordConverter(table, config);
+
+    // MicroTime value: microseconds since midnight
+    // 11:22:33.123456 in microseconds
+    long microsValue = (11L * 3600 + 22 * 60 + 33) * 1_000_000 + 123456;
+    LocalTime expected = LocalTime.of(11, 22, 33, 123456000);
+
+    LocalTime result = converter.convertTimeValue(microsValue, "io.debezium.time.MicroTime");
+    assertThat(result).isEqualTo(expected);
+  }
+
+  @Test
+  public void testDebeziumNanoTimeConversion() {
+    Table table = mock(Table.class);
+    when(table.schema()).thenReturn(SIMPLE_SCHEMA);
+    RecordConverter converter = new RecordConverter(table, config);
+
+    // NanoTime value: nanoseconds since midnight
+    // 11:22:33.123456789 in nanoseconds
+    long nanosValue = (11L * 3600 + 22 * 60 + 33) * 1_000_000_000 + 123456789;
+    // Note: Iceberg Time only supports microsecond precision
+    LocalTime expected = LocalTime.of(11, 22, 33, 123456000);
+
+    LocalTime result = converter.convertTimeValue(nanosValue, "io.debezium.time.NanoTime");
+    assertThat(result).isEqualTo(expected);
+  }
+
+  @Test
+  public void testDebeziumZonedTimeConversion() {
+    Table table = mock(Table.class);
+    when(table.schema()).thenReturn(SIMPLE_SCHEMA);
+    RecordConverter converter = new RecordConverter(table, config);
+
+    // ZonedTime value: ISO 8601 time string with timezone
+    String isoValue = "11:22:33.123456+02:00";
+    LocalTime expected = LocalTime.of(11, 22, 33, 123456000);
+
+    LocalTime result = converter.convertTimeValue(isoValue, "io.debezium.time.ZonedTime");
+    assertThat(result).isEqualTo(expected);
+  }
+
   private Map<String, Object> createMapData() {
     return ImmutableMap.<String, Object>builder()
         .put("i", 1)
