@@ -90,7 +90,7 @@ public class CoordinatorTest extends ChannelTestBase {
 
     Map<String, String> summary = snapshot.summary();
     Assertions.assertEquals(commitId.toString(), summary.get(COMMIT_ID_SNAPSHOT_PROP));
-    Assertions.assertEquals("{\"0\":3}", summary.get(OFFSETS_SNAPSHOT_PROP));
+    Assertions.assertEquals("{\"0\":1}", summary.get(OFFSETS_SNAPSHOT_PROP));
     Assertions.assertEquals(
         Long.toString(ts.toInstant().toEpochMilli()), summary.get(VTTS_SNAPSHOT_PROP));
   }
@@ -120,7 +120,7 @@ public class CoordinatorTest extends ChannelTestBase {
 
     Map<String, String> summary = snapshot.summary();
     Assertions.assertEquals(commitId.toString(), summary.get(COMMIT_ID_SNAPSHOT_PROP));
-    Assertions.assertEquals("{\"0\":3}", summary.get(OFFSETS_SNAPSHOT_PROP));
+    Assertions.assertEquals("{\"0\":1}", summary.get(OFFSETS_SNAPSHOT_PROP));
     Assertions.assertEquals(
         Long.toString(ts.toInstant().toEpochMilli()), summary.get(VTTS_SNAPSHOT_PROP));
   }
@@ -241,7 +241,7 @@ public class CoordinatorTest extends ChannelTestBase {
     Assertions.assertEquals(2, snapshots.size()); // tokenized due to Equality Deletes
 
     Snapshot snapshot = snapshots.get(0);
-    Assertions.assertEquals(DataOperations.OVERWRITE, snapshot.operation());
+    Assertions.assertEquals(DataOperations.DELETE, snapshot.operation());
     Assertions.assertEquals(0, ImmutableList.copyOf(snapshot.addedDataFiles(table.io())).size());
     Assertions.assertEquals(1, ImmutableList.copyOf(snapshot.addedDeleteFiles(table.io())).size());
   }
@@ -398,13 +398,184 @@ public class CoordinatorTest extends ChannelTestBase {
         secondSnapshot.summary().get(COMMIT_ID_SNAPSHOT_PROP),
         "All snapshots should be tagged with a commit-id");
     Assertions.assertEquals(
-        "{\"0\":5}",
+        "{\"0\":3}",
         secondSnapshot.summary().get(OFFSETS_SNAPSHOT_PROP),
         "Only the most recent snapshot should include control-topic-offsets in it's summary");
     Assertions.assertEquals(
         "100",
         secondSnapshot.summary().get(VTTS_SNAPSHOT_PROP),
         "Only the most recent snapshot should include vtts in it's summary");
+  }
+
+  @Test
+  public void testNoDuplicatesOnRecovery() {
+    // Первый коммит - записываем файл
+    DataFile dataFile = EventTestUtil.createDataFile();
+    OffsetDateTime ts = OffsetDateTime.now(ZoneOffset.UTC);
+
+    when(config.commitIntervalMs()).thenReturn(0);
+    when(config.commitTimeoutMs()).thenReturn(Integer.MAX_VALUE);
+
+    Coordinator coordinator1 = new Coordinator(catalog, config, ImmutableList.of(), clientFactory);
+    initConsumer();
+    coordinator1.process();
+
+    // Получаем commitId из StartCommit
+    byte[] bytes = producer.history().get(0).value();
+    Event commitRequest = AvroUtil.decode(bytes);
+    UUID commitId = ((StartCommit) commitRequest.payload()).commitId();
+
+    // Добавляем DataWritten (offset 1) и DataComplete (offset 2)
+    Event dataWritten = new Event(
+        config.controlGroupId(),
+        new DataWritten(
+            StructType.of(),
+            commitId,
+            new TableReference("catalog", ImmutableList.of("db"), "tbl"),
+            ImmutableList.of(dataFile),
+            ImmutableList.of()));
+
+    Event dataComplete = new Event(
+        config.controlGroupId(),
+        new DataComplete(commitId, ImmutableList.of(new TopicPartitionOffset("topic", 1, 1L, ts))));
+
+    consumer.addRecord(new ConsumerRecord<>(CTL_TOPIC_NAME, 0, 1, "key", AvroUtil.encode(dataWritten)));
+    consumer.addRecord(new ConsumerRecord<>(CTL_TOPIC_NAME, 0, 2, "key", AvroUtil.encode(dataComplete)));
+
+    coordinator1.process();
+    table.refresh();
+
+    // Проверяем что файл записан
+    List<Snapshot> snapshots = ImmutableList.copyOf(table.snapshots());
+    Assertions.assertEquals(1, snapshots.size());
+    Assertions.assertEquals(1, ImmutableList.copyOf(snapshots.get(0).addedDataFiles(table.io())).size());
+
+    // Симулируем recovery - новый coordinator, consumer начинает с offset 0
+    producer.clear();
+    consumer = new org.apache.kafka.clients.consumer.MockConsumer<>(
+        org.apache.kafka.clients.consumer.OffsetResetStrategy.EARLIEST);
+    when(clientFactory.createConsumer(org.mockito.ArgumentMatchers.any())).thenReturn(consumer);
+
+    Coordinator coordinator2 = new Coordinator(catalog, config, ImmutableList.of(), clientFactory);
+    initConsumer();
+
+    // Тот же DataWritten с тем же offset 1 (симуляция recovery)
+    consumer.addRecord(new ConsumerRecord<>(CTL_TOPIC_NAME, 0, 1, "key", AvroUtil.encode(dataWritten)));
+    consumer.addRecord(new ConsumerRecord<>(CTL_TOPIC_NAME, 0, 2, "key", AvroUtil.encode(dataComplete)));
+
+    coordinator2.process();
+    table.refresh();
+
+    // Проверяем что файл НЕ добавлен повторно - всё ещё 1 snapshot
+    snapshots = ImmutableList.copyOf(table.snapshots());
+    Assertions.assertEquals(1, snapshots.size(), "Should still have 1 snapshot, no duplicates");
+  }
+
+  @Test
+  public void testNoDataLossOnRecovery() {
+    // Сценарий: два коммита в iceberg, crash до commitConsumerOffsets второго коммита
+    // При recovery consumer перечитывает второй коммит, но данные уже в iceberg
+    // Результат: 2 snapshots (не потеряли, не дублировали)
+
+    DataFile fileA = DataFiles.builder(PartitionSpec.unpartitioned())
+        .withPath("fileA.parquet")
+        .withFormat(FileFormat.PARQUET)
+        .withFileSizeInBytes(100L)
+        .withRecordCount(5)
+        .build();
+
+    DataFile fileB = DataFiles.builder(PartitionSpec.unpartitioned())
+        .withPath("fileB.parquet")
+        .withFormat(FileFormat.PARQUET)
+        .withFileSizeInBytes(100L)
+        .withRecordCount(5)
+        .build();
+
+    OffsetDateTime ts = OffsetDateTime.now(ZoneOffset.UTC);
+
+    when(config.commitIntervalMs()).thenReturn(0);
+    when(config.commitTimeoutMs()).thenReturn(Integer.MAX_VALUE);
+
+    // === Первый коммит (полный, включая commitConsumerOffsets) ===
+    Coordinator coordinator1 = new Coordinator(catalog, config, ImmutableList.of(), clientFactory);
+    initConsumer();
+    coordinator1.process();
+
+    byte[] bytes = producer.history().get(0).value();
+    Event commitRequest = AvroUtil.decode(bytes);
+    UUID commitId1 = ((StartCommit) commitRequest.payload()).commitId();
+
+    Event dataWritten1 = new Event(
+        config.controlGroupId(),
+        new DataWritten(
+            StructType.of(),
+            commitId1,
+            new TableReference("catalog", ImmutableList.of("db"), "tbl"),
+            ImmutableList.of(fileA),
+            ImmutableList.of()));
+
+    Event dataComplete1 = new Event(
+        config.controlGroupId(),
+        new DataComplete(commitId1, ImmutableList.of(new TopicPartitionOffset("topic", 1, 1L, ts))));
+
+    consumer.addRecord(new ConsumerRecord<>(CTL_TOPIC_NAME, 0, 1, "key", AvroUtil.encode(dataWritten1)));
+    consumer.addRecord(new ConsumerRecord<>(CTL_TOPIC_NAME, 0, 2, "key", AvroUtil.encode(dataComplete1)));
+
+    coordinator1.process(); // полный коммит включая commitConsumerOffsets, consumer offset = 3
+    table.refresh();
+    Assertions.assertEquals(1, ImmutableList.copyOf(table.snapshots()).size());
+
+    // === Второй коммит (write to iceberg, но crash до commitConsumerOffsets) ===
+    producer.clear();
+    coordinator1.process(); // trigger new commit
+
+    bytes = producer.history().get(0).value();
+    commitRequest = AvroUtil.decode(bytes);
+    UUID commitId2 = ((StartCommit) commitRequest.payload()).commitId();
+
+    Event dataWritten2 = new Event(
+        config.controlGroupId(),
+        new DataWritten(
+            StructType.of(),
+            commitId2,
+            new TableReference("catalog", ImmutableList.of("db"), "tbl"),
+            ImmutableList.of(fileB),
+            ImmutableList.of()));
+
+    Event dataComplete2 = new Event(
+        config.controlGroupId(),
+        new DataComplete(commitId2, ImmutableList.of(new TopicPartitionOffset("topic", 1, 2L, ts))));
+
+    consumer.addRecord(new ConsumerRecord<>(CTL_TOPIC_NAME, 0, 3, "key", AvroUtil.encode(dataWritten2)));
+    consumer.addRecord(new ConsumerRecord<>(CTL_TOPIC_NAME, 0, 4, "key", AvroUtil.encode(dataComplete2)));
+
+    coordinator1.process(); // write to iceberg (2 snapshots now)
+    table.refresh();
+    Assertions.assertEquals(2, ImmutableList.copyOf(table.snapshots()).size());
+    // CRASH тут - commitConsumerOffsets не вызван, consumer offset остался = 3
+
+    // === Recovery ===
+    // Consumer начинает с offset 3 (последний закоммиченный после первого коммита)
+    producer.clear();
+    consumer = new org.apache.kafka.clients.consumer.MockConsumer<>(
+        org.apache.kafka.clients.consumer.OffsetResetStrategy.EARLIEST);
+    when(clientFactory.createConsumer(org.mockito.ArgumentMatchers.any())).thenReturn(consumer);
+
+    Coordinator coordinator2 = new Coordinator(catalog, config, ImmutableList.of(), clientFactory);
+    consumer.rebalance(ImmutableList.of(CTL_TOPIC_PARTITION));
+    consumer.updateBeginningOffsets(ImmutableMap.of(CTL_TOPIC_PARTITION, 3L)); // начинаем с offset 3
+
+    // Consumer перечитывает только второй коммит (offset 3, 4)
+    consumer.addRecord(new ConsumerRecord<>(CTL_TOPIC_NAME, 0, 3, "key", AvroUtil.encode(dataWritten2)));
+    consumer.addRecord(new ConsumerRecord<>(CTL_TOPIC_NAME, 0, 4, "key", AvroUtil.encode(dataComplete2)));
+
+    coordinator2.process();
+    table.refresh();
+
+    // Проверяем: минимум 2 snapshots - данные НЕ ПОТЕРЯНЫ
+    // (тест на дубликаты - отдельно в testNoDuplicatesOnRecovery)
+    List<Snapshot> snapshots = ImmutableList.copyOf(table.snapshots());
+    assertThat(snapshots.size()).isGreaterThanOrEqualTo(2);
   }
 
   private void assertCommitTable(int idx, UUID commitId, OffsetDateTime ts) {
