@@ -28,6 +28,7 @@ public class CoordinatorThread extends Thread {
 
   private final Coordinator coordinator;
   private volatile boolean terminated;
+  private volatile boolean stopped;
 
   public CoordinatorThread(Coordinator coordinator) {
     super(THREAD_NAME);
@@ -47,6 +48,7 @@ public class CoordinatorThread extends Thread {
 
     try {
       coordinator.stop();
+      stopped = true;
     } catch (Exception e) {
       LOG.error("Coordinator error during stop, ignoring", e);
     }
@@ -65,7 +67,7 @@ public class CoordinatorThread extends Thread {
       throw new ConnectException(e);
     }
 
-    if (coordinator != null) {
+    if (!stopped) {
       throw new ConnectException("Coordinator was not stopped during thread termination");
     }
   }
