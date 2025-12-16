@@ -23,41 +23,25 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 import io.tabular.iceberg.connect.IcebergSinkConfig;
-<<<<<<< HEAD
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
-import java.util.UUID;
-import org.apache.iceberg.connect.events.DataComplete;
-import org.apache.iceberg.connect.events.Event;
-import org.apache.iceberg.connect.events.Payload;
-import org.apache.iceberg.connect.events.TopicPartitionOffset;
-=======
-import io.tabular.iceberg.connect.events.CommitReadyPayload;
-import io.tabular.iceberg.connect.events.CommitResponsePayload;
-import io.tabular.iceberg.connect.events.Event;
-import io.tabular.iceberg.connect.events.EventType;
-import io.tabular.iceberg.connect.events.Payload;
-import io.tabular.iceberg.connect.events.TableName;
-import io.tabular.iceberg.connect.events.TopicPartitionOffset;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.stream.Collectors;
 import java.util.stream.Stream;
-import org.apache.iceberg.DataFile;
-import org.apache.iceberg.DataFiles;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileContent;
-import org.apache.iceberg.FileFormat;
-import org.apache.iceberg.FileMetadata;
-import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.catalog.TableIdentifier;
->>>>>>> anmol/feature/debug
+import org.apache.iceberg.connect.events.DataComplete;
+import org.apache.iceberg.connect.events.DataWritten;
+import org.apache.iceberg.connect.events.Event;
+import org.apache.iceberg.connect.events.Payload;
+import org.apache.iceberg.connect.events.TableReference;
+import org.apache.iceberg.connect.events.TopicPartitionOffset;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
-import org.apache.iceberg.types.Types.StructType;
 import org.apache.iceberg.util.Pair;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -145,12 +129,12 @@ public class CommitStateTest {
     CommitState commitState = new CommitState(mock(IcebergSinkConfig.class));
     List<Envelope> envelopeList =
         Arrays.asList(
-            wrapInEnvelope(ImmutableList.of(FileContent.DATA, FileContent.POSITION_DELETES), 0L),
-            wrapInEnvelope(ImmutableList.of(FileContent.DATA, FileContent.EQUALITY_DELETES), 1L),
-            wrapInEnvelope(ImmutableList.of(FileContent.DATA), 2L),
-            wrapInEnvelope(ImmutableList.of(FileContent.DATA, FileContent.EQUALITY_DELETES), 3L),
-            wrapInEnvelope(ImmutableList.of(FileContent.DATA), 4L),
-            wrapInEnvelope(ImmutableList.of(FileContent.DATA, FileContent.EQUALITY_DELETES), 5L));
+            wrapDataWrittenEnvelope(ImmutableList.of(FileContent.DATA, FileContent.POSITION_DELETES), 0L),
+            wrapDataWrittenEnvelope(ImmutableList.of(FileContent.DATA, FileContent.EQUALITY_DELETES), 1L),
+            wrapDataWrittenEnvelope(ImmutableList.of(FileContent.DATA), 2L),
+            wrapDataWrittenEnvelope(ImmutableList.of(FileContent.DATA, FileContent.EQUALITY_DELETES), 3L),
+            wrapDataWrittenEnvelope(ImmutableList.of(FileContent.DATA), 4L),
+            wrapDataWrittenEnvelope(ImmutableList.of(FileContent.DATA, FileContent.EQUALITY_DELETES), 5L));
 
     envelopeList.forEach(commitState::addResponse);
 
@@ -167,9 +151,9 @@ public class CommitStateTest {
   }
 
   private static Stream<Pair<List<Envelope>, List<List<Envelope>>>> envelopeListProvider() {
-    Envelope posDelete = wrapInEnvelope(ImmutableList.of(FileContent.POSITION_DELETES), 0L);
-    Envelope eqDelete = wrapInEnvelope(ImmutableList.of(FileContent.EQUALITY_DELETES), 0L);
-    Envelope data = wrapInEnvelope(ImmutableList.of(FileContent.DATA), 0L);
+    Envelope posDelete = wrapDataWrittenEnvelope(ImmutableList.of(FileContent.POSITION_DELETES), 0L);
+    Envelope eqDelete = wrapDataWrittenEnvelope(ImmutableList.of(FileContent.EQUALITY_DELETES), 0L);
+    Envelope data = wrapDataWrittenEnvelope(ImmutableList.of(FileContent.DATA), 0L);
     return Stream.of(
         Pair.of(Arrays.asList(data, eqDelete), Arrays.asList(List.of(data), List.of(eqDelete))),
         Pair.of(
@@ -192,62 +176,29 @@ public class CommitStateTest {
                 List.of(posDelete), List.of(eqDelete), List.of(eqDelete), List.of(eqDelete))));
   }
 
-  private static Envelope wrapInEnvelope(List<FileContent> fileContents, Long offset) {
-    final UUID payLoadCommitId = UUID.fromString("4142add7-7c92-4bbe-b864-21ce8ac4bf53");
-    final TableIdentifier tableIdentifier = TableIdentifier.of("db", "tbl");
-    final TableName tableName = TableName.of(tableIdentifier);
-    final String groupId = "some-group";
+  private static Envelope wrapDataWrittenEnvelope(List<FileContent> fileContents, Long offset) {
+    TableIdentifier tableIdentifier = TableIdentifier.of("db", "tbl");
+    TableReference tableRef = mock(TableReference.class);
+    when(tableRef.identifier()).thenReturn(tableIdentifier);
 
     List<DeleteFile> deleteFiles = Lists.newLinkedList();
-    List<DataFile> dataFiles = Lists.newLinkedList();
 
-    Map<FileContent, List<FileContent>> fileMap =
-        fileContents.stream().collect(Collectors.groupingBy(f -> f));
+    for (FileContent content : fileContents) {
+      if (content == FileContent.EQUALITY_DELETES || content == FileContent.POSITION_DELETES) {
+        DeleteFile deleteFile = mock(DeleteFile.class);
+        when(deleteFile.content()).thenReturn(content);
+        deleteFiles.add(deleteFile);
+      }
+    }
 
-    fileMap
-        .getOrDefault(FileContent.DATA, ImmutableList.of())
-        .forEach(
-            x ->
-                dataFiles.add(
-                    DataFiles.builder(PartitionSpec.unpartitioned())
-                        .withPath("data.parquet")
-                        .withFormat(FileFormat.PARQUET)
-                        .withFileSizeInBytes(100L)
-                        .withRecordCount(5)
-                        .build()));
+    DataWritten dataWritten = mock(DataWritten.class);
+    when(dataWritten.deleteFiles()).thenReturn(deleteFiles);
+    when(dataWritten.tableReference()).thenReturn(tableRef);
 
-    fileMap
-        .getOrDefault(FileContent.EQUALITY_DELETES, ImmutableList.of())
-        .forEach(
-            x ->
-                deleteFiles.add(
-                    FileMetadata.deleteFileBuilder(PartitionSpec.unpartitioned())
-                        .ofEqualityDeletes(1)
-                        .withPath("delete.parquet")
-                        .withFileSizeInBytes(10)
-                        .withRecordCount(1)
-                        .build()));
+    Event event = mock(Event.class);
+    when(event.payload()).thenReturn(dataWritten);
 
-    fileMap
-        .getOrDefault(FileContent.POSITION_DELETES, ImmutableList.of())
-        .forEach(
-            x ->
-                deleteFiles.add(
-                    FileMetadata.deleteFileBuilder(PartitionSpec.unpartitioned())
-                        .ofPositionDeletes()
-                        .withPath("delete.parquet")
-                        .withFileSizeInBytes(10)
-                        .withRecordCount(1)
-                        .build()));
-
-    return new Envelope(
-        new Event(
-            groupId,
-            EventType.COMMIT_RESPONSE,
-            new CommitResponsePayload(
-                StructType.of(), payLoadCommitId, tableName, dataFiles, deleteFiles)),
-        0,
-        offset);
+    return new Envelope(event, 0, offset);
   }
 
   private Envelope wrapInEnvelope(Payload payload) {

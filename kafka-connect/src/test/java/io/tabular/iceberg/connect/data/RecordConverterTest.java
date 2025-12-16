@@ -64,6 +64,7 @@ import org.apache.iceberg.types.Types.IntegerType;
 import org.apache.iceberg.types.Types.ListType;
 import org.apache.iceberg.types.Types.LongType;
 import org.apache.iceberg.types.Types.MapType;
+import org.apache.iceberg.types.Types.NestedField;
 import org.apache.iceberg.types.Types.StringType;
 import org.apache.iceberg.types.Types.StructType;
 import org.apache.iceberg.types.Types.TimeType;
@@ -869,8 +870,8 @@ public class RecordConverterTest {
     RecordConverter converter = new RecordConverter(table, config);
 
     // MicroTimestamp value: microseconds since epoch
-    // 2023-05-18T11:22:33Z in microseconds
-    long microsValue = 1684409553000000L;
+    // 2023-05-18T11:22:33 UTC in microseconds = 1684408953000000
+    long microsValue = 1684408953000000L;
     LocalDateTime expected = LocalDateTime.parse("2023-05-18T11:22:33");
 
     Temporal result =
@@ -886,8 +887,8 @@ public class RecordConverterTest {
     RecordConverter converter = new RecordConverter(table, config);
 
     // NanoTimestamp value: nanoseconds since epoch
-    // 2023-05-18T11:22:33Z in nanoseconds
-    long nanosValue = 1684409553000000000L;
+    // 2023-05-18T11:22:33 UTC in nanoseconds = 1684408953000000000
+    long nanosValue = 1684408953000000000L;
     LocalDateTime expected = LocalDateTime.parse("2023-05-18T11:22:33");
 
     Temporal result =
@@ -903,7 +904,8 @@ public class RecordConverterTest {
     RecordConverter converter = new RecordConverter(table, config);
 
     // Timestamp value: milliseconds since epoch
-    long millisValue = 1684409553000L;
+    // 2023-05-18T11:22:33 UTC in milliseconds = 1684408953000
+    long millisValue = 1684408953000L;
     LocalDateTime expected = LocalDateTime.parse("2023-05-18T11:22:33");
 
     Temporal result =
