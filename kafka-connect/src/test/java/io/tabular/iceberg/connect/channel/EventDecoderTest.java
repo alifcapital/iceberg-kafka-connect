@@ -165,7 +165,7 @@ public class EventDecoderTest {
     assertThat(payload.tableReference().catalog()).isEqualTo("catalog");
     assertThat(payload.tableReference().identifier()).isEqualTo(TableIdentifier.of("db", "tbl"));
 
-    assertThat(payload.writeSchema()).isEqualTo(
+    assertThat(payload.writeSchema().toString()).isEqualTo(
             Types.StructType.of(
                     Types.NestedField.required(10_300, "commit_id", Types.UUIDType.get()),
                     Types.NestedField.required(
@@ -177,7 +177,7 @@ public class EventDecoderTest {
                     Types.NestedField.optional(
                             10_304,
                             "delete_files",
-                            Types.ListType.ofRequired(10_304, DataFile.getType(spec.partitionType())))));
+                            Types.ListType.ofRequired(10_304, DataFile.getType(spec.partitionType())))).toString());
   }
 
   @Test
