@@ -57,7 +57,7 @@ public class PartitionedDeltaWriterTest extends BaseWriterTest {
     row2.setField("id2", 234L);
 
     WriteResult result =
-        writeTest(ImmutableList.of(row1, row2), config, PartitionedDeltaWriter.class);
+        writeTest(ImmutableList.of(row1, row2), config, CompactPartitionedDeltaWriter.class);
 
     // in upsert mode, each write is a delete + append, so we'll have 1 data file
     // and 1 delete file for each partition (2 total)

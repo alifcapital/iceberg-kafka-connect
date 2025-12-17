@@ -16,6 +16,9 @@ dependencies {
   testImplementation libs.mockito
   testImplementation libs.assertj
 
+  // parquet-column needed for GenericParquetReaders in tests
+  testImplementation 'org.apache.parquet:parquet-column:1.14.0'
+
   testImplementation 'ch.qos.logback:logback-classic:1.5.3'
 }
 
