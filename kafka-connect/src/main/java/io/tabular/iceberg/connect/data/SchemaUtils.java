@@ -243,12 +243,36 @@ public class SchemaUtils {
               return DateType.get();
             } else if (valueSchema.name().equals(Time.LOGICAL_NAME)) {
               return TimeType.get();
+            } else if (config.schemaDebeziumTimeTypes()) {
+              switch (valueSchema.name()) {
+                case "io.debezium.time.Date":
+                  return DateType.get();
+                case "io.debezium.time.Time":
+                  return TimeType.get();
+                default:
+                  break;
+              }
             }
           }
           return IntegerType.get();
         case INT64:
-          if (valueSchema.name() != null && valueSchema.name().equals(Timestamp.LOGICAL_NAME)) {
-            return TimestampType.withZone();
+          if (valueSchema.name() != null) {
+            if (valueSchema.name().equals(Timestamp.LOGICAL_NAME)) {
+              return TimestampType.withZone();
+            } else if (config.schemaDebeziumTimeTypes()) {
+              switch (valueSchema.name()) {
+                case "io.debezium.time.Timestamp":
+                case "io.debezium.time.MicroTimestamp":
+                case "io.debezium.time.NanoTimestamp":
+                  // These represent timestamps without timezone info in Debezium
+                  return TimestampType.withoutZone();
+                case "io.debezium.time.MicroTime":
+                case "io.debezium.time.NanoTime":
+                  return TimeType.get();
+                default:
+                  break;
+              }
+            }
           }
           return LongType.get();
         case FLOAT32:
@@ -283,6 +307,19 @@ public class SchemaUtils {
                   .collect(toList());
           return StructType.of(structFields);
         case STRING:
+          if (config.schemaDebeziumTimeTypes() && valueSchema.name() != null) {
+            switch (valueSchema.name()) {
+              case "io.debezium.time.ZonedTimestamp":
+                // ISO 8601 string with timezone -> timestamptz
+                return TimestampType.withZone();
+              case "io.debezium.time.ZonedTime":
+                // ISO 8601 time string with timezone -> time
+                return TimeType.get();
+              default:
+                break;
+            }
+          }
+          return StringType.get();
         default:
           return StringType.get();
       }
