@@ -90,6 +90,48 @@ public class CompactKeyMapTest {
   }
 
   @Test
+  public void testLongKeyFallbackOnSentinel() {
+    CompactKeyMap map = CompactKeyMap.create(LONG_KEY_SCHEMA);
+
+    Record key1 = GenericRecord.create(LONG_KEY_SCHEMA);
+    key1.setField("id", 123L);
+
+    Record sentinelKey = GenericRecord.create(LONG_KEY_SCHEMA);
+    sentinelKey.setField("id", Long.MIN_VALUE);
+
+    assertThat(map.put(key1, "/path/file1.parquet", 1)).isNull();
+    assertThat(map.put(sentinelKey, "/path/file2.parquet", 2)).isNull();
+    assertThat(map.size()).isEqualTo(2);
+
+    CompactKeyMap.PathOffset removed = map.remove(sentinelKey);
+    assertThat(removed).isNotNull();
+    assertThat(removed.position).isEqualTo(2);
+    assertThat(map.getPath(removed.pathIndex)).isEqualTo("/path/file2.parquet");
+    assertThat(map.size()).isEqualTo(1);
+  }
+
+  @Test
+  public void testLongKeyFallbackOnTombstoneSentinel() {
+    CompactKeyMap map = CompactKeyMap.create(LONG_KEY_SCHEMA);
+
+    Record key1 = GenericRecord.create(LONG_KEY_SCHEMA);
+    key1.setField("id", 123L);
+
+    Record tombstoneKey = GenericRecord.create(LONG_KEY_SCHEMA);
+    tombstoneKey.setField("id", Long.MIN_VALUE + 1);
+
+    assertThat(map.put(key1, "/path/file1.parquet", 1)).isNull();
+    assertThat(map.put(tombstoneKey, "/path/file2.parquet", 2)).isNull();
+    assertThat(map.size()).isEqualTo(2);
+
+    CompactKeyMap.PathOffset removed = map.remove(tombstoneKey);
+    assertThat(removed).isNotNull();
+    assertThat(removed.position).isEqualTo(2);
+    assertThat(map.getPath(removed.pathIndex)).isEqualTo("/path/file2.parquet");
+    assertThat(map.size()).isEqualTo(1);
+  }
+
+  @Test
   public void testStringKeyPutGetRemove() {
     CompactKeyMap map = CompactKeyMap.create(STRING_KEY_SCHEMA);
 

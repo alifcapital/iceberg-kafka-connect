@@ -22,6 +22,7 @@ import java.math.BigDecimal;
 import java.util.Arrays;
 import java.util.List;
 import org.apache.iceberg.Schema;
+import org.apache.iceberg.data.GenericRecord;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
@@ -98,7 +99,7 @@ public abstract class CompactKeyMap {
       switch (typeId) {
         case INTEGER:
         case LONG:
-          return new LongKeyMap();
+          return new LongKeyMap(deleteSchema);
         case STRING:
           return new LazyStringKeyMap();
         case DECIMAL:
@@ -127,12 +128,20 @@ public abstract class CompactKeyMap {
     private static final int INITIAL_CAPACITY = 1024;
     private static final float LOAD_FACTOR = 0.5f;
 
+    private final boolean keyIsInteger;
+    private final String keyFieldName;
+    private final Record reusableKeyRecord;
+    private CompactKeyMap delegate;
+
     private long[] keys;
     private long[] values; // packed (pathIndex << 32) | position
     private int size;
     private int threshold;
 
-    LongKeyMap() {
+    LongKeyMap(Schema deleteSchema) {
+      this.keyIsInteger = deleteSchema.columns().get(0).type().typeId() == Type.TypeID.INTEGER;
+      this.keyFieldName = deleteSchema.columns().get(0).name();
+      this.reusableKeyRecord = GenericRecord.create(deleteSchema);
       keys = new long[INITIAL_CAPACITY];
       values = new long[INITIAL_CAPACITY];
       Arrays.fill(keys, EMPTY_KEY);
@@ -141,8 +150,15 @@ public abstract class CompactKeyMap {
 
     @Override
     public PathOffset put(Record key, String path, int position) {
+      if (delegate != null) {
+        return delegate.put(key, path, position);
+      }
       Object val = key.get(0, Object.class);
       long k = val instanceof Integer ? ((Integer) val).longValue() : (Long) val;
+      if (k == EMPTY_KEY || k == TOMBSTONE) {
+        migrateToDelegate();
+        return delegate.put(keyRecord(k), path, position);
+      }
       return putInternal(k, internPath(path), position);
     }
 
@@ -173,8 +189,15 @@ public abstract class CompactKeyMap {
 
     @Override
     public PathOffset remove(Record key) {
+      if (delegate != null) {
+        return delegate.remove(key);
+      }
       Object val = key.get(0, Object.class);
       long k = val instanceof Integer ? ((Integer) val).longValue() : (Long) val;
+      if (k == EMPTY_KEY || k == TOMBSTONE) {
+        migrateToDelegate();
+        return delegate.remove(keyRecord(k));
+      }
 
       int mask = keys.length - 1;
       int idx = hash(k) & mask;
@@ -222,15 +245,55 @@ public abstract class CompactKeyMap {
 
     @Override
     public int size() {
-      return size;
+      return delegate != null ? delegate.size() : size;
     }
 
     @Override
     public void clear() {
-      Arrays.fill(keys, EMPTY_KEY);
-      size = 0;
+      if (delegate != null) {
+        delegate.clear();
+        delegate = null;
+      }
+      if (keys != null) {
+        Arrays.fill(keys, EMPTY_KEY);
+        size = 0;
+      }
       paths.clear();
       pathToIndex.clear();
+    }
+
+    @Override
+    public String getPath(int index) {
+      return delegate != null ? delegate.getPath(index) : super.getPath(index);
+    }
+
+    private Record keyRecord(long k) {
+      reusableKeyRecord.setField(keyFieldName, keyIsInteger ? (int) k : k);
+      return reusableKeyRecord;
+    }
+
+    private void migrateToDelegate() {
+      if (delegate != null) {
+        return;
+      }
+      delegate = new MultiColumnKeyMap(1);
+      delegate.paths.addAll(this.paths);
+      delegate.pathToIndex.putAll(this.pathToIndex);
+
+      for (int i = 0; i < keys.length; i++) {
+        long k = keys[i];
+        if (k != EMPTY_KEY && k != TOMBSTONE) {
+          long packed = values[i];
+          int pathIndex = (int) (packed >>> 32);
+          int position = (int) packed;
+          delegate.put(keyRecord(k), getPath(pathIndex), position);
+        }
+      }
+
+      keys = null;
+      values = null;
+      size = 0;
+      threshold = 0;
     }
   }
 
