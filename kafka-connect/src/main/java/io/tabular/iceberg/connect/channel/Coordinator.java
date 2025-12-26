@@ -25,6 +25,7 @@ import static java.util.stream.Collectors.toMap;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.tabular.iceberg.connect.IcebergSinkConfig;
+import io.tabular.iceberg.connect.data.PartitionStatsManager;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.time.Duration;
@@ -41,7 +42,9 @@ import org.apache.iceberg.AppendFiles;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileFormat;
+import org.apache.iceberg.PartitionStatisticsFile;
 import org.apache.iceberg.PartitionSpec;
+import org.apache.iceberg.Partitioning;
 import org.apache.iceberg.RowDelta;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.Table;
@@ -419,7 +422,12 @@ public class Coordinator extends Channel implements AutoCloseable {
         deltaOp.commit();
       }
 
-      Long snapshotId = latestSnapshot(table, branch.orElse(null)).snapshotId();
+      Snapshot snapshot = latestSnapshot(table, branch.orElse(null));
+      Long snapshotId = snapshot.snapshotId();
+
+      // Update partition stats if table is partitioned
+      updatePartitionStats(table, snapshot, dataFiles, deleteFiles);
+
       Event event =
           new Event(
               config.controlGroupId(),
@@ -436,6 +444,41 @@ public class Coordinator extends Channel implements AutoCloseable {
           snapshotId,
           commitState.currentCommitId(),
           vtts);
+    }
+  }
+
+  private void updatePartitionStats(
+      Table table,
+      Snapshot snapshot,
+      List<DataFile> dataFiles,
+      List<DeleteFile> deleteFiles) {
+    if (!config.partitionStatsEnabled()) {
+      return;
+    }
+
+    if (!Partitioning.isPartitioned(table)) {
+      return;
+    }
+
+    try {
+      PartitionStatisticsFile statsFile =
+          PartitionStatsManager.computeAndWriteStatsFile(
+              table, snapshot, dataFiles, deleteFiles);
+
+      if (statsFile != null) {
+        table.updatePartitionStatistics().setPartitionStatistics(statsFile).commit();
+        LOG.info(
+            "Updated partition stats for table {}, snapshot {}",
+            table.name(),
+            snapshot.snapshotId());
+      }
+    } catch (Exception e) {
+      // Partition stats failure should not fail the commit
+      LOG.warn(
+          "Failed to update partition stats for table {}, snapshot {}: {}",
+          table.name(),
+          snapshot.snapshotId(),
+          e.getMessage());
     }
   }
 
