@@ -161,6 +161,20 @@ public class Utilities {
 
     Set<Integer> identifierFieldIds = table.schema().identifierFieldIds();
 
+    // If CDC/upsert mode but no identifier fields in schema, use all primitive columns
+    // This supports CDC without PK (like PostgreSQL REPLICA_IDENTITY_FULL)
+    boolean isCdcMode = config.tablesCdcField() != null || config.upsertModeEnabled();
+    if (isCdcMode && (identifierFieldIds == null || identifierFieldIds.isEmpty())) {
+      identifierFieldIds = table.schema().columns().stream()
+          .filter(f -> f.type().isPrimitiveType())
+          .filter(f -> !f.type().typeId().equals(org.apache.iceberg.types.Type.TypeID.FLOAT))
+          .filter(f -> !f.type().typeId().equals(org.apache.iceberg.types.Type.TypeID.DOUBLE))
+          .map(org.apache.iceberg.types.Types.NestedField::fieldId)
+          .collect(toSet());
+      LOG.info("CDC mode without PK for table {}, using {} columns for equality delete",
+          tableName, identifierFieldIds.size());
+    }
+
     // Use full metrics for file_path to enable proper position delete file indexing.
     // Without this, truncated bounds cause pos-delete files to be assigned to all data files.
     tableProps.putIfAbsent("write.metadata.metrics.column.file_path", "full");

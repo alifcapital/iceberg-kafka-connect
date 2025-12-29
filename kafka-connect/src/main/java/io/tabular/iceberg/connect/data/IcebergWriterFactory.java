@@ -103,22 +103,28 @@ public class IcebergWriterFactory {
                 .collect(toSet());
         }
 
-        schema = new org.apache.iceberg.Schema(structType.fields(), equalityFieldIds);
-
+        // If we have explicit PK, create schema with identifierFieldIds (requires NOT NULL columns)
+        // If no PK, create schema without identifierFieldIds - writer will use all columns for equality delete
         if (!equalityFieldIds.isEmpty()) {
-            for (Integer fieldId : equalityFieldIds) {
-                String fieldName = schema.findColumnName(fieldId);
-                // Enable bloom filter for faster equality lookups
-                tableProperties.put(
-                    "write.parquet.bloom-filter-enabled.column." + fieldName,
-                    "true"
-                );
-                // Use full metrics (no truncation) for proper equality delete file indexing
-                tableProperties.put(
-                    "write.metadata.metrics.column." + fieldName,
-                    "full"
-                );
-            }
+          schema = new org.apache.iceberg.Schema(structType.fields(), equalityFieldIds);
+          for (Integer fieldId : equalityFieldIds) {
+            String fieldName = schema.findColumnName(fieldId);
+            // Enable bloom filter for faster equality lookups
+            tableProperties.put(
+                "write.parquet.bloom-filter-enabled.column." + fieldName,
+                "true"
+            );
+            // Use full metrics (no truncation) for proper equality delete file indexing
+            tableProperties.put(
+                "write.metadata.metrics.column." + fieldName,
+                "full"
+            );
+          }
+        } else {
+          // No PK - create table without identifierFieldIds
+          // Utilities.createTableWriter will use all columns for equality delete
+          schema = new org.apache.iceberg.Schema(structType.fields());
+          LOG.info("No primary key defined for CDC table {}, will use all columns for equality delete", tableName);
         }
       } else {
         schema = new org.apache.iceberg.Schema(structType.fields());
