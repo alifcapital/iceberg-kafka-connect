@@ -91,6 +91,7 @@ public class IcebergSinkConfig extends AbstractConfig {
   private static final String COMMIT_TIMEOUT_MS_PROP = "iceberg.control.commit.timeout-ms";
   private static final int COMMIT_TIMEOUT_MS_DEFAULT = 30_000;
   private static final String COMMIT_THREADS_PROP = "iceberg.control.commit.threads";
+  private static final String PARTITION_STATS_ENABLED_PROP = "iceberg.control.commit.partition-stats-enabled";
   private static final String CONNECT_GROUP_ID_PROP = "iceberg.connect.group-id";
   private static final String HADDOP_CONF_DIR_PROP = "iceberg.hadoop-conf-dir";
 
@@ -232,6 +233,12 @@ public class IcebergSinkConfig extends AbstractConfig {
         Runtime.getRuntime().availableProcessors() * 2,
         Importance.MEDIUM,
         "Coordinator threads to use for table commits, default is (cores * 2)");
+    configDef.define(
+        PARTITION_STATS_ENABLED_PROP,
+        Type.BOOLEAN,
+        true,
+        Importance.MEDIUM,
+        "Set to true to update partition statistics on each commit, false to disable");
     configDef.define(
         HADDOP_CONF_DIR_PROP,
         Type.STRING,
@@ -425,6 +432,10 @@ public class IcebergSinkConfig extends AbstractConfig {
 
   public int commitThreads() {
     return getInt(COMMIT_THREADS_PROP);
+  }
+
+  public boolean partitionStatsEnabled() {
+    return getBoolean(PARTITION_STATS_ENABLED_PROP);
   }
 
   public String hadoopConfDir() {
