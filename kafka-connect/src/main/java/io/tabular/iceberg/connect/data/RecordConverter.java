@@ -109,16 +109,26 @@ public class RecordConverter {
 
   private Object convertValue(
       Object value, Type type, int fieldId, SchemaUpdate.Consumer schemaUpdateConsumer) {
+    return convertValue(value, type, fieldId, schemaUpdateConsumer, null);
+  }
+
+  private Object convertValue(
+      Object value,
+      Type type,
+      int fieldId,
+      SchemaUpdate.Consumer schemaUpdateConsumer,
+      org.apache.kafka.connect.data.Schema sourceSchema) {
     if (value == null) {
       return null;
     }
+    String sourceSchemaName = sourceSchema != null ? sourceSchema.name() : null;
     switch (type.typeId()) {
       case STRUCT:
         return convertStructValue(value, type.asStructType(), fieldId, schemaUpdateConsumer);
       case LIST:
-        return convertListValue(value, type.asListType(), schemaUpdateConsumer);
+        return convertListValue(value, type.asListType(), schemaUpdateConsumer, sourceSchema);
       case MAP:
-        return convertMapValue(value, type.asMapType(), schemaUpdateConsumer);
+        return convertMapValue(value, type.asMapType(), schemaUpdateConsumer, sourceSchema);
       case INTEGER:
         return convertInt(value);
       case LONG:
@@ -141,9 +151,9 @@ public class RecordConverter {
       case DATE:
         return convertDateValue(value);
       case TIME:
-        return convertTimeValue(value);
+        return convertTimeValue(value, sourceSchemaName);
       case TIMESTAMP:
-        return convertTimestampValue(value, (TimestampType) type);
+        return convertTimestampValue(value, (TimestampType) type, sourceSchemaName);
     }
     throw new UnsupportedOperationException("Unsupported type: " + type.typeId());
   }
@@ -206,7 +216,8 @@ public class RecordConverter {
                     recordFieldValue,
                     tableField.type(),
                     tableField.fieldId(),
-                    schemaUpdateConsumer));
+                    schemaUpdateConsumer,
+                    null));
           }
         });
     return result;
@@ -278,7 +289,8 @@ public class RecordConverter {
                   struct.get(recordField),
                   tableField.type(),
                   tableField.fieldId(),
-                  schemaUpdateConsumer));
+                  schemaUpdateConsumer,
+                  recordField.schema()));
         }
       }
     }
@@ -315,30 +327,43 @@ public class RecordConverter {
   }
 
   protected List<Object> convertListValue(
-      Object value, ListType type, SchemaUpdate.Consumer schemaUpdateConsumer) {
+      Object value,
+      ListType type,
+      SchemaUpdate.Consumer schemaUpdateConsumer,
+      org.apache.kafka.connect.data.Schema sourceSchema) {
     Preconditions.checkArgument(value instanceof List);
     List<?> list = (List<?>) value;
+    org.apache.kafka.connect.data.Schema elementSchema =
+        sourceSchema != null ? sourceSchema.valueSchema() : null;
     return list.stream()
         .map(
             element -> {
               int fieldId = type.fields().get(0).fieldId();
-              return convertValue(element, type.elementType(), fieldId, schemaUpdateConsumer);
+              return convertValue(
+                  element, type.elementType(), fieldId, schemaUpdateConsumer, elementSchema);
             })
         .collect(toList());
   }
 
   protected Map<Object, Object> convertMapValue(
-      Object value, MapType type, SchemaUpdate.Consumer schemaUpdateConsumer) {
+      Object value,
+      MapType type,
+      SchemaUpdate.Consumer schemaUpdateConsumer,
+      org.apache.kafka.connect.data.Schema sourceSchema) {
     Preconditions.checkArgument(value instanceof Map);
     Map<?, ?> map = (Map<?, ?>) value;
     Map<Object, Object> result = Maps.newHashMap();
+    org.apache.kafka.connect.data.Schema keySchema =
+        sourceSchema != null ? sourceSchema.keySchema() : null;
+    org.apache.kafka.connect.data.Schema valueSchema =
+        sourceSchema != null ? sourceSchema.valueSchema() : null;
     map.forEach(
         (k, v) -> {
           int keyFieldId = type.fields().get(0).fieldId();
           int valueFieldId = type.fields().get(1).fieldId();
           result.put(
-              convertValue(k, type.keyType(), keyFieldId, schemaUpdateConsumer),
-              convertValue(v, type.valueType(), valueFieldId, schemaUpdateConsumer));
+              convertValue(k, type.keyType(), keyFieldId, schemaUpdateConsumer, keySchema),
+              convertValue(v, type.valueType(), valueFieldId, schemaUpdateConsumer, valueSchema));
         });
     return result;
   }
@@ -464,11 +489,44 @@ public class RecordConverter {
   }
 
   protected LocalTime convertTimeValue(Object value) {
+    return convertTimeValue(value, null);
+  }
+
+  protected LocalTime convertTimeValue(Object value, String sourceSchemaName) {
     if (value instanceof Number) {
-      long millis = ((Number) value).longValue();
-      return DateTimeUtil.timeFromMicros(millis * 1000);
+      long numValue = ((Number) value).longValue();
+      long micros;
+      if (config.schemaDebeziumTimeTypes() && sourceSchemaName != null) {
+        switch (sourceSchemaName) {
+          case "io.debezium.time.MicroTime":
+            // Value is already in microseconds
+            micros = numValue;
+            break;
+          case "io.debezium.time.NanoTime":
+            // Convert nanoseconds to microseconds
+            micros = numValue / 1000;
+            break;
+          default:
+            // Default: assume milliseconds
+            micros = numValue * 1000;
+            break;
+        }
+      } else {
+        // Default: assume milliseconds
+        micros = numValue * 1000;
+      }
+      return DateTimeUtil.timeFromMicros(micros);
     } else if (value instanceof String) {
-      return LocalTime.parse((String) value);
+      String str = (String) value;
+      if (config.schemaDebeziumTimeTypes()
+          && "io.debezium.time.ZonedTime".equals(sourceSchemaName)) {
+        try {
+          return java.time.OffsetTime.parse(str).withOffsetSameInstant(ZoneOffset.UTC).toLocalTime();
+        } catch (DateTimeParseException e) {
+          // Fall through to LocalTime parsing
+        }
+      }
+      return LocalTime.parse(str);
     } else if (value instanceof LocalTime) {
       return (LocalTime) value;
     } else if (value instanceof Date) {
@@ -479,16 +537,22 @@ public class RecordConverter {
   }
 
   protected Temporal convertTimestampValue(Object value, TimestampType type) {
-    if (type.shouldAdjustToUTC()) {
-      return convertOffsetDateTime(value);
-    }
-    return convertLocalDateTime(value);
+    return convertTimestampValue(value, type, null);
   }
 
-  private OffsetDateTime convertOffsetDateTime(Object value) {
+  protected Temporal convertTimestampValue(
+      Object value, TimestampType type, String sourceSchemaName) {
+    if (type.shouldAdjustToUTC()) {
+      return convertOffsetDateTime(value, sourceSchemaName);
+    }
+    return convertLocalDateTime(value, sourceSchemaName);
+  }
+
+  private OffsetDateTime convertOffsetDateTime(Object value, String sourceSchemaName) {
     if (value instanceof Number) {
-      long millis = ((Number) value).longValue();
-      return DateTimeUtil.timestamptzFromMicros(millis * 1000);
+      long numValue = ((Number) value).longValue();
+      long micros = convertToMicros(numValue, sourceSchemaName);
+      return DateTimeUtil.timestamptzFromMicros(micros);
     } else if (value instanceof String) {
       return parseOffsetDateTime((String) value);
     } else if (value instanceof OffsetDateTime) {
@@ -503,19 +567,32 @@ public class RecordConverter {
   }
 
   private OffsetDateTime parseOffsetDateTime(String str) {
+    // Handle special PostgreSQL values
+    if ("infinity".equals(str)) {
+      return OffsetDateTime.MAX;
+    } else if ("-infinity".equals(str)) {
+      return OffsetDateTime.MIN;
+    }
+
     String tsStr = ensureTimestampFormat(str);
     try {
       return OFFSET_TS_FMT.parse(tsStr, OffsetDateTime::from);
     } catch (DateTimeParseException e) {
-      return LocalDateTime.parse(tsStr, DateTimeFormatter.ISO_LOCAL_DATE_TIME)
-          .atOffset(ZoneOffset.UTC);
+      // Try ISO_OFFSET_DATE_TIME for formats like "2020-04-01T11:51:02.000000Z"
+      try {
+        return OffsetDateTime.parse(tsStr, DateTimeFormatter.ISO_OFFSET_DATE_TIME);
+      } catch (DateTimeParseException e2) {
+        return LocalDateTime.parse(tsStr, DateTimeFormatter.ISO_LOCAL_DATE_TIME)
+            .atOffset(ZoneOffset.UTC);
+      }
     }
   }
 
-  private LocalDateTime convertLocalDateTime(Object value) {
+  private LocalDateTime convertLocalDateTime(Object value, String sourceSchemaName) {
     if (value instanceof Number) {
-      long millis = ((Number) value).longValue();
-      return DateTimeUtil.timestampFromMicros(millis * 1000);
+      long numValue = ((Number) value).longValue();
+      long micros = convertToMicros(numValue, sourceSchemaName);
+      return DateTimeUtil.timestampFromMicros(micros);
     } else if (value instanceof String) {
       return parseLocalDateTime((String) value);
     } else if (value instanceof LocalDateTime) {
@@ -527,6 +604,33 @@ public class RecordConverter {
     }
     throw new ConnectException(
         "Cannot convert timestamp: " + value + ", type: " + value.getClass());
+  }
+
+  /**
+   * Converts a numeric timestamp value to microseconds based on the source schema type.
+   *
+   * @param numValue the numeric value from the source
+   * @param sourceSchemaName the Debezium/Connect schema name indicating the precision
+   * @return the value in microseconds
+   */
+  private long convertToMicros(long numValue, String sourceSchemaName) {
+    if (config.schemaDebeziumTimeTypes() && sourceSchemaName != null) {
+      switch (sourceSchemaName) {
+        case "io.debezium.time.MicroTimestamp":
+          // Value is already in microseconds
+          return numValue;
+        case "io.debezium.time.NanoTimestamp":
+          // Convert nanoseconds to microseconds
+          return numValue / 1000;
+        case "io.debezium.time.Timestamp":
+          // Value is in milliseconds
+          return numValue * 1000;
+        default:
+          break;
+      }
+    }
+    // Default: assume milliseconds (Kafka Connect Timestamp behavior)
+    return numValue * 1000;
   }
 
   private LocalDateTime parseLocalDateTime(String str) {

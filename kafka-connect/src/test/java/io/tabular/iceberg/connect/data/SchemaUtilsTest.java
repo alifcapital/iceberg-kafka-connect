@@ -308,6 +308,77 @@ public class SchemaUtilsTest {
   }
 
   @Test
+  public void testToIcebergTypeDebeziumTimeTypesDisabled() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.schemaForceOptional()).thenReturn(false);
+    when(config.schemaDebeziumTimeTypes()).thenReturn(false);
+
+    // When debezium time types are disabled, these should map to basic types
+    Schema microTimestampSchema =
+        SchemaBuilder.int64().name("io.debezium.time.MicroTimestamp").build();
+    assertThat(SchemaUtils.toIcebergType(microTimestampSchema, config)).isInstanceOf(LongType.class);
+
+    Schema zonedTimestampSchema =
+        SchemaBuilder.string().name("io.debezium.time.ZonedTimestamp").build();
+    assertThat(SchemaUtils.toIcebergType(zonedTimestampSchema, config))
+        .isInstanceOf(StringType.class);
+  }
+
+  @Test
+  public void testToIcebergTypeDebeziumTimeTypesEnabled() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.schemaForceOptional()).thenReturn(false);
+    when(config.schemaDebeziumTimeTypes()).thenReturn(true);
+
+    // io.debezium.time.Date (INT32) -> DateType
+    Schema debeziumDateSchema = SchemaBuilder.int32().name("io.debezium.time.Date").build();
+    assertThat(SchemaUtils.toIcebergType(debeziumDateSchema, config)).isInstanceOf(DateType.class);
+
+    // io.debezium.time.Time (INT32) -> TimeType
+    Schema debeziumTimeSchema = SchemaBuilder.int32().name("io.debezium.time.Time").build();
+    assertThat(SchemaUtils.toIcebergType(debeziumTimeSchema, config)).isInstanceOf(TimeType.class);
+
+    // io.debezium.time.Timestamp (INT64) -> TimestampType without zone
+    Schema timestampSchema = SchemaBuilder.int64().name("io.debezium.time.Timestamp").build();
+    Type timestampType = SchemaUtils.toIcebergType(timestampSchema, config);
+    assertThat(timestampType).isInstanceOf(TimestampType.class);
+    assertThat(((TimestampType) timestampType).shouldAdjustToUTC()).isFalse();
+
+    // io.debezium.time.MicroTimestamp (INT64) -> TimestampType without zone
+    Schema microTimestampSchema =
+        SchemaBuilder.int64().name("io.debezium.time.MicroTimestamp").build();
+    Type microTimestampType = SchemaUtils.toIcebergType(microTimestampSchema, config);
+    assertThat(microTimestampType).isInstanceOf(TimestampType.class);
+    assertThat(((TimestampType) microTimestampType).shouldAdjustToUTC()).isFalse();
+
+    // io.debezium.time.NanoTimestamp (INT64) -> TimestampType without zone
+    Schema nanoTimestampSchema =
+        SchemaBuilder.int64().name("io.debezium.time.NanoTimestamp").build();
+    Type nanoTimestampType = SchemaUtils.toIcebergType(nanoTimestampSchema, config);
+    assertThat(nanoTimestampType).isInstanceOf(TimestampType.class);
+    assertThat(((TimestampType) nanoTimestampType).shouldAdjustToUTC()).isFalse();
+
+    // io.debezium.time.MicroTime (INT64) -> TimeType
+    Schema microTimeSchema = SchemaBuilder.int64().name("io.debezium.time.MicroTime").build();
+    assertThat(SchemaUtils.toIcebergType(microTimeSchema, config)).isInstanceOf(TimeType.class);
+
+    // io.debezium.time.NanoTime (INT64) -> TimeType
+    Schema nanoTimeSchema = SchemaBuilder.int64().name("io.debezium.time.NanoTime").build();
+    assertThat(SchemaUtils.toIcebergType(nanoTimeSchema, config)).isInstanceOf(TimeType.class);
+
+    // io.debezium.time.ZonedTimestamp (STRING) -> TimestampType with zone
+    Schema zonedTimestampSchema =
+        SchemaBuilder.string().name("io.debezium.time.ZonedTimestamp").build();
+    Type zonedTimestampType = SchemaUtils.toIcebergType(zonedTimestampSchema, config);
+    assertThat(zonedTimestampType).isInstanceOf(TimestampType.class);
+    assertThat(((TimestampType) zonedTimestampType).shouldAdjustToUTC()).isTrue();
+
+    // io.debezium.time.ZonedTime (STRING) -> TimeType
+    Schema zonedTimeSchema = SchemaBuilder.string().name("io.debezium.time.ZonedTime").build();
+    assertThat(SchemaUtils.toIcebergType(zonedTimeSchema, config)).isInstanceOf(TimeType.class);
+  }
+
+  @Test
   public void testInferIcebergTypeEmpty() {
     IcebergSinkConfig config = mock(IcebergSinkConfig.class);
 
