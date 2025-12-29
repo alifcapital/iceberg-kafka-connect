@@ -578,6 +578,39 @@ public class CoordinatorTest extends ChannelTestBase {
     assertThat(snapshots.size()).isGreaterThanOrEqualTo(2);
   }
 
+  @Test
+  public void testCommittedOffsetMerging() {
+    // Setup: create initial snapshot with partition 1 offset
+    DataFile initialFile = DataFiles.builder(PartitionSpec.unpartitioned())
+        .withPath("initial.parquet")
+        .withFormat(FileFormat.PARQUET)
+        .withFileSizeInBytes(100L)
+        .withRecordCount(5)
+        .build();
+
+    table.newAppend()
+        .appendFile(initialFile)
+        .set(OFFSETS_SNAPSHOT_PROP, "{\"1\":7}")
+        .commit();
+
+    table.refresh();
+    assertThat(table.snapshots()).hasSize(1);
+    assertThat(table.currentSnapshot().summary())
+        .containsEntry(OFFSETS_SNAPSHOT_PROP, "{\"1\":7}");
+
+    // Now trigger commit with partition 0 data
+    OffsetDateTime ts = OffsetDateTime.ofInstant(Instant.now(), ZoneOffset.UTC);
+    UUID commitId =
+        coordinatorTest(ImmutableList.of(EventTestUtil.createDataFile()), ImmutableList.of(), ts);
+
+    // Verify merged offsets contain both partitions
+    table.refresh();
+    assertThat(table.snapshots()).hasSize(2);
+    // Partition 0 offset from current commit (1), partition 1 offset preserved (7)
+    assertThat(table.currentSnapshot().summary())
+        .containsEntry(OFFSETS_SNAPSHOT_PROP, "{\"0\":1,\"1\":7}");
+  }
+
   private void assertCommitTable(int idx, UUID commitId, OffsetDateTime ts) {
     byte[] bytes = producer.history().get(idx).value();
     Event commitTable = AvroUtil.decode(bytes);

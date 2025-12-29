@@ -344,7 +344,7 @@ public class Coordinator extends Channel implements AutoCloseable {
       })
       .collect(toList());
 
-    Map<Integer, Long> offsetMap = filteredEnvelopeList.stream()
+    Map<Integer, Long> currentOffsets = filteredEnvelopeList.stream()
     .collect(groupingBy(
         Envelope::partition,
         Collectors.mapping(
@@ -356,9 +356,18 @@ public class Coordinator extends Channel implements AutoCloseable {
         e -> e.getValue().get()
     ));
 
+    // Merge last committed offsets with current offsets, taking max for conflicts
+    Map<Integer, Long> mergedOffsets =
+        java.util.stream.Stream.of(lastCommittedOffsets, currentOffsets)
+            .flatMap(map -> map.entrySet().stream())
+            .collect(toMap(
+                Map.Entry::getKey,
+                Map.Entry::getValue,
+                Long::max));
+
     String offsetsJson;
     try {
-        offsetsJson = MAPPER.writeValueAsString(offsetMap);
+        offsetsJson = MAPPER.writeValueAsString(mergedOffsets);
     } catch (IOException e) {
         throw new UncheckedIOException(e);
     }
