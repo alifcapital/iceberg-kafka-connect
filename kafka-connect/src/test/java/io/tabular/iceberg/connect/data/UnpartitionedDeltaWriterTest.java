@@ -49,7 +49,7 @@ public class UnpartitionedDeltaWriterTest extends BaseWriterTest {
     row.setField("data", "hello world!");
     row.setField("id2", 123L);
 
-    WriteResult result = writeTest(ImmutableList.of(row), config, UnpartitionedDeltaWriter.class);
+    WriteResult result = writeTest(ImmutableList.of(row), config, CompactUnpartitionedDeltaWriter.class);
 
     // in upsert mode, each write is a delete + append, so we'll have 1 data file
     // and 1 delete file

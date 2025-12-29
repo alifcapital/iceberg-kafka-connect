@@ -232,7 +232,7 @@ public class Utilities {
                 table.spec(), format, appenderFactory, fileFactory, table.io(), targetFileSize);
       } else {
         writer =
-            new UnpartitionedDeltaWriter(
+            new CompactUnpartitionedDeltaWriter(
                 table.spec(),
                 format,
                 appenderFactory,
@@ -256,7 +256,7 @@ public class Utilities {
                 table.schema());
       } else {
         writer =
-            new PartitionedDeltaWriter(
+            new CompactPartitionedDeltaWriter(
                 table.spec(),
                 format,
                 appenderFactory,

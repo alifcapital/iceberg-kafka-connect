@@ -32,6 +32,11 @@ subprojects {
 
   test {
     useJUnitPlatform()
+    // Pass benchmark property to enable benchmark tests
+    if (project.hasProperty('benchmark')) {
+      systemProperty 'benchmark', project.property('benchmark')
+      maxHeapSize = '4g'
+    }
   }
 
   jar {
