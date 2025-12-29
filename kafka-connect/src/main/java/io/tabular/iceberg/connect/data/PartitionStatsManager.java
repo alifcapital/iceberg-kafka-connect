@@ -46,11 +46,13 @@ import org.apache.iceberg.PartitionData;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.PartitionStatisticsFile;
 import org.apache.iceberg.PartitionStats;
+import org.apache.iceberg.PartitionStatsUtil;
 import org.apache.iceberg.Partitioning;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.StructLike;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.data.GenericRecord;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.FileAppender;
 import org.apache.iceberg.io.FileIO;
@@ -62,6 +64,7 @@ import org.apache.iceberg.types.Types.IntegerType;
 import org.apache.iceberg.types.Types.LongType;
 import org.apache.iceberg.types.Types.NestedField;
 import org.apache.iceberg.types.Types.StructType;
+import org.apache.iceberg.util.Pair;
 import org.apache.iceberg.util.PartitionMap;
 import org.apache.iceberg.util.PartitionUtil;
 import org.apache.iceberg.util.SnapshotUtil;
@@ -71,7 +74,7 @@ import org.slf4j.LoggerFactory;
 /**
  * Manages incremental partition statistics updates during commits.
  *
- * <p>Logic:
+ * <p>Logic copied from Iceberg's PartitionStatsHandler:
  * <ul>
  *   <li>If no previous stats file exists - log warning and skip (run compute_partition_stats first)
  *   <li>If stats file is from direct parent snapshot - use delta from dataFiles/deleteFiles (fast path)
@@ -148,11 +151,6 @@ public class PartitionStatsManager {
       return null;
     }
 
-    if (dataFiles.isEmpty() && deleteFiles.isEmpty()) {
-      LOG.debug("No files to commit for table {}, skipping partition stats", table.name());
-      return null;
-    }
-
     long currentSnapshotId = currentSnapshot.snapshotId();
 
     // Find latest stats file in ancestry
@@ -166,6 +164,12 @@ public class PartitionStatsManager {
       return null;
     }
 
+    if (statsInfo.statsFile.snapshotId() == currentSnapshotId) {
+      // no-op - stats already exist for this snapshot
+      LOG.info("Returning existing statistics file for snapshot {}", currentSnapshotId);
+      return statsInfo.statsFile;
+    }
+
     StructType partitionType = Partitioning.partitionType(table);
     PartitionMap<PartitionStats> statsMap = PartitionMap.create(table.specs());
 
@@ -175,16 +179,34 @@ public class PartitionStatsManager {
     // Apply updates based on whether stats file is from direct parent or older
     if (statsInfo.isDirectParent) {
       // Fast path: stats file is from parent snapshot, just add our delta
+      if (dataFiles.isEmpty() && deleteFiles.isEmpty()) {
+        LOG.debug("No files to commit for table {}, skipping partition stats update", table.name());
+        return null;
+      }
       LOG.debug("Using fast path - stats file is from direct parent snapshot");
       applyFileDelta(table, statsMap, partitionType, dataFiles, deleteFiles, currentSnapshot);
     } else {
-      // Slow path: need to scan manifests between stats snapshot and current
+      // Slow path: compute stats diff between snapshots using Iceberg's algorithm
       LOG.debug(
-          "Using incremental path - scanning manifests from snapshot {} to {}",
+          "Using incremental path - computing stats diff from snapshot {} to {}",
           statsInfo.statsFile.snapshotId(),
           currentSnapshotId);
-      applyIncrementalFromManifests(
-          table, statsMap, partitionType, statsInfo.statsFile.snapshotId(), currentSnapshot);
+
+      Snapshot fromSnapshot = table.snapshot(statsInfo.statsFile.snapshotId());
+      PartitionMap<PartitionStats> incrementalStatsMap =
+          PartitionStatsUtil.computeStatsDiff(table, fromSnapshot, currentSnapshot);
+
+      // Merge incremental stats into existing stats
+      // Convert PartitionData into GenericRecord and merge
+      incrementalStatsMap.forEach(
+          (key, value) ->
+              statsMap.merge(
+                  Pair.of(key.first(), partitionDataToRecord((PartitionData) key.second())),
+                  value,
+                  (existingEntry, newEntry) -> {
+                    existingEntry.appendStats(newEntry);
+                    return existingEntry;
+                  }));
     }
 
     if (statsMap.isEmpty()) {
@@ -200,6 +222,14 @@ public class PartitionStatsManager {
     } catch (IOException e) {
       throw new UncheckedIOException("Failed to write partition stats file", e);
     }
+  }
+
+  private static GenericRecord partitionDataToRecord(PartitionData data) {
+    GenericRecord record = GenericRecord.create(data.getPartitionType());
+    for (int index = 0; index < record.size(); index++) {
+      record.set(index, data.get(index));
+    }
+    return record;
   }
 
   private static class StatsFileInfo {
@@ -247,22 +277,12 @@ public class PartitionStatsManager {
       PartitionMap<PartitionStats> statsMap) {
 
     Schema statsSchema = schema(partitionType);
-    FileFormat format = FileFormat.fromFileName(statsFile.path());
 
-    if (format == null) {
-      LOG.warn("Unable to determine format of stats file: {}", statsFile.path());
-      return;
-    }
-
-    try (CloseableIterable<StructLike> records =
-        InternalData.read(format, table.io().newInputFile(statsFile.path()))
-            .project(statsSchema)
-            .build()) {
-
-      for (StructLike record : records) {
-        PartitionStats stats = recordToPartitionStats(record);
-        statsMap.put(stats.specId(), stats.partition(), stats);
-      }
+    try (CloseableIterable<PartitionStats> oldStats =
+        PartitionStatsUtil.readPartitionStatsFile(statsSchema, table, statsFile.path())) {
+      oldStats.forEach(
+          partitionStats ->
+              statsMap.put(partitionStats.specId(), partitionStats.partition(), partitionStats));
 
       LOG.debug(
           "Loaded {} existing partition stats entries from {}",
@@ -277,21 +297,6 @@ public class PartitionStatsManager {
       throw new UncheckedIOException(
           new IOException("Failed to load partition stats", e));
     }
-  }
-
-  private static PartitionStats recordToPartitionStats(StructLike record) {
-    int pos = 0;
-    PartitionStats stats =
-        new PartitionStats(
-            record.get(pos++, StructLike.class), // partition
-            record.get(pos++, Integer.class)); // spec id
-
-    // Set remaining fields
-    for (; pos < record.size(); pos++) {
-      stats.set(pos, record.get(pos, Object.class));
-    }
-
-    return stats;
   }
 
   /**
@@ -314,58 +319,6 @@ public class PartitionStatsManager {
     }
   }
 
-  /**
-   * Slow path: scan manifests between snapshots to compute incremental stats.
-   */
-  private static void applyIncrementalFromManifests(
-      Table table,
-      PartitionMap<PartitionStats> statsMap,
-      StructType partitionType,
-      long fromSnapshotId,
-      Snapshot toSnapshot) {
-
-    FileIO io = table.io();
-    Map<Integer, PartitionSpec> specs = table.specs();
-
-    // Get snapshots between fromSnapshot (exclusive) and toSnapshot (inclusive)
-    Iterable<Snapshot> snapshots =
-        SnapshotUtil.ancestorsBetween(toSnapshot.snapshotId(), fromSnapshotId, table::snapshot);
-
-    // Collect manifests added by each snapshot in the range
-    List<ManifestFile> manifests = Lists.newArrayList();
-    for (Snapshot snapshot : snapshots) {
-      for (ManifestFile manifest : snapshot.allManifests(io)) {
-        // Only include manifests added by this snapshot
-        if (manifest.snapshotId() != null && manifest.snapshotId().equals(snapshot.snapshotId())) {
-          manifests.add(manifest);
-        }
-      }
-    }
-
-    for (ManifestFile manifest : manifests) {
-      if (manifest.content() == ManifestContent.DATA) {
-        try (ManifestReader<DataFile> reader =
-            ManifestFiles.read(manifest, io, specs).select(Lists.newArrayList("*"))) {
-          for (DataFile file : reader) {
-            applyFileToStats(table, statsMap, partitionType, file, toSnapshot);
-          }
-        } catch (IOException e) {
-          throw new UncheckedIOException("Failed to read manifest: " + manifest.path(), e);
-        }
-      } else {
-        try (ManifestReader<DeleteFile> reader =
-            ManifestFiles.readDeleteManifest(manifest, io, specs)
-                .select(Lists.newArrayList("*"))) {
-          for (DeleteFile file : reader) {
-            applyFileToStats(table, statsMap, partitionType, file, toSnapshot);
-          }
-        } catch (IOException e) {
-          throw new UncheckedIOException("Failed to read delete manifest: " + manifest.path(), e);
-        }
-      }
-    }
-  }
-
   private static void applyFileToStats(
       Table table,
       PartitionMap<PartitionStats> statsMap,
@@ -385,35 +338,8 @@ public class PartitionStatsManager {
             ((PartitionData) file.partition()).copy(),
             () -> new PartitionStats(coercedPartition, specId));
 
-    FileContent content = file.content();
-    switch (content) {
-      case DATA:
-        stats.set(2, stats.dataRecordCount() + file.recordCount());
-        stats.set(3, stats.dataFileCount() + 1);
-        stats.set(4, stats.totalDataFileSizeInBytes() + file.fileSizeInBytes());
-        break;
-
-      case POSITION_DELETES:
-        stats.set(5, stats.positionDeleteRecordCount() + file.recordCount());
-        stats.set(6, stats.positionDeleteFileCount() + 1);
-        break;
-
-      case EQUALITY_DELETES:
-        stats.set(7, stats.equalityDeleteRecordCount() + file.recordCount());
-        stats.set(8, stats.equalityDeleteFileCount() + 1);
-        break;
-
-      default:
-        LOG.warn("Unknown file content type: {}", content);
-    }
-
-    if (snapshot != null) {
-      Long currentLastUpdated = stats.lastUpdatedAt();
-      if (currentLastUpdated == null || currentLastUpdated < snapshot.timestampMillis()) {
-        stats.set(10, snapshot.timestampMillis());
-        stats.set(11, snapshot.snapshotId());
-      }
-    }
+    // Use PartitionStats.liveEntry() - matches Iceberg exactly
+    stats.liveEntry(file, snapshot);
   }
 
   /**
@@ -432,29 +358,11 @@ public class PartitionStatsManager {
     }
 
     StructType partitionType = Partitioning.partitionType(table);
-    PartitionMap<PartitionStats> statsMap = PartitionMap.create(table.specs());
-    FileIO io = table.io();
-    Map<Integer, PartitionSpec> specs = table.specs();
 
-    // Scan all manifests in the snapshot
-    for (ManifestFile manifest : snapshot.allManifests(io)) {
-      if (manifest.content() == ManifestContent.DATA) {
-        try (ManifestReader<DataFile> reader =
-            ManifestFiles.read(manifest, io, specs).select(Lists.newArrayList("*"))) {
-          for (DataFile file : reader) {
-            applyFileToStats(table, statsMap, partitionType, file, snapshot);
-          }
-        }
-      } else {
-        try (ManifestReader<DeleteFile> reader =
-            ManifestFiles.readDeleteManifest(manifest, io, specs)
-                .select(Lists.newArrayList("*"))) {
-          for (DeleteFile file : reader) {
-            applyFileToStats(table, statsMap, partitionType, file, snapshot);
-          }
-        }
-      }
-    }
+    // Use PartitionStatsUtil.computeStats with incremental=false for full computation
+    List<ManifestFile> manifests = snapshot.allManifests(table.io());
+    PartitionMap<PartitionStats> statsMap =
+        PartitionStatsUtil.computeStats(table, manifests, false /* incremental */);
 
     if (statsMap.isEmpty()) {
       return null;

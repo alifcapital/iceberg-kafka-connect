@@ -178,6 +178,72 @@ public class PartitionStatsManagerTest {
   }
 
   @Test
+  public void testIncrementalAfterDataFileDeletion() throws IOException {
+    // Step 1: Create initial data - 2 files in same partition
+    DataFile file1 = createDataFile("2024-01-01", 100, 1000);
+    DataFile file2 = createDataFile("2024-01-01", 200, 2000);
+    table.newAppend().appendFile(file1).appendFile(file2).commit();
+    Snapshot snapshot1 = table.currentSnapshot();
+
+    PartitionStatisticsFile initialStats =
+        PartitionStatsManager.computeFullStats(table, snapshot1);
+    assertThat(initialStats).isNotNull();
+    table.updatePartitionStatistics().setPartitionStatistics(initialStats).commit();
+
+    // Verify initial stats
+    Map<String, PartitionStatsRecord> initialMap = readStatsFile(table, initialStats);
+    PartitionStatsRecord initialRecord = initialMap.values().iterator().next();
+    assertThat(initialRecord.dataFileCount).isEqualTo(2);
+    assertThat(initialRecord.dataRecordCount).isEqualTo(300L);
+
+    // Step 2: Add another file (creates gap - snapshot without stats)
+    DataFile file3 = createDataFile("2024-01-02", 50, 500);
+    table.newAppend().appendFile(file3).commit();
+
+    // Step 3: Delete one file (simulates compaction removing old file)
+    table.newDelete().deleteFile(file1).commit();
+    Snapshot snapshot3 = table.currentSnapshot();
+
+    // Now stats file is from snapshot1, but current is snapshot3 with 2 snapshots gap
+    // This forces slow path
+    table.refresh();
+    PartitionStatisticsFile incrementalStats =
+        PartitionStatsManager.computeAndWriteStatsFile(
+            table, snapshot3, ImmutableList.of(), ImmutableList.of());
+    assertThat(incrementalStats).isNotNull();
+
+    // Step 4: Compute from scratch for comparison
+    PartitionStatisticsFile fullStats =
+        PartitionStatsManager.computeFullStats(table, snapshot3);
+    assertThat(fullStats).isNotNull();
+
+    // Step 5: Compare - both should match
+    Map<String, PartitionStatsRecord> incrementalMap = readStatsFile(table, incrementalStats);
+    Map<String, PartitionStatsRecord> fullMap = readStatsFile(table, fullStats);
+
+    assertThat(incrementalMap.keySet()).isEqualTo(fullMap.keySet());
+
+    for (String partition : incrementalMap.keySet()) {
+      PartitionStatsRecord incr = incrementalMap.get(partition);
+      PartitionStatsRecord full = fullMap.get(partition);
+
+      assertThat(incr.dataRecordCount)
+          .as("dataRecordCount for partition " + partition)
+          .isEqualTo(full.dataRecordCount);
+      assertThat(incr.dataFileCount)
+          .as("dataFileCount for partition " + partition)
+          .isEqualTo(full.dataFileCount);
+      assertThat(incr.totalDataFileSizeInBytes)
+          .as("totalDataFileSizeInBytes for partition " + partition)
+          .isEqualTo(full.totalDataFileSizeInBytes);
+    }
+
+    // Verify expected state: file2 in 2024-01-01 (200 records), file3 in 2024-01-02 (50 records)
+    // file1 was deleted
+    assertThat(fullMap).hasSize(2); // two partitions
+  }
+
+  @Test
   public void testReturnsNullWithoutExistingStatsFile() {
     DataFile file1 = createDataFile("2024-01-01", 100, 1000);
     table.newAppend().appendFile(file1).commit();
