@@ -25,6 +25,7 @@ import io.tabular.iceberg.connect.data.IcebergWriterFactory;
 import io.tabular.iceberg.connect.data.Offset;
 import io.tabular.iceberg.connect.data.RecordWriter;
 import io.tabular.iceberg.connect.data.Utilities;
+import io.tabular.iceberg.connect.data.WriteComplete;
 import io.tabular.iceberg.connect.data.WriterResult;
 import java.io.IOException;
 import java.util.Collection;
@@ -46,7 +47,7 @@ class Worker implements Writer, AutoCloseable {
   private final IcebergSinkConfig config;
   private final IcebergWriterFactory writerFactory;
   private final Map<String, RecordWriter> writers;
-  private final Map<TopicPartition, Offset> sourceOffsets;
+  private final Map<TopicPartition, Offset> dataOffsets;
 
   Worker(IcebergSinkConfig config, Catalog catalog) {
     this(config, new IcebergWriterFactory(catalog, config));
@@ -57,26 +58,35 @@ class Worker implements Writer, AutoCloseable {
     this.config = config;
     this.writerFactory = writerFactory;
     this.writers = Maps.newHashMap();
-    this.sourceOffsets = Maps.newHashMap();
+    this.dataOffsets = Maps.newHashMap();
   }
 
   @Override
   public Committable committable() {
+    List<WriteComplete> writeCompletes =
+        writers.values().stream().map(RecordWriter::complete).collect(toList());
+
     List<WriterResult> writeResults =
-        writers.values().stream().flatMap(writer -> writer.complete().stream()).collect(toList());
-    Map<TopicPartition, Offset> offsets = Maps.newHashMap(sourceOffsets);
+        writeCompletes.stream()
+            .flatMap(wc -> wc.writerResults().stream())
+            .collect(toList());
+
+    Map<TopicPartition, Offset> tableDataOffsets = Maps.newHashMap();
+    writeCompletes.forEach(wc -> tableDataOffsets.putAll(wc.dataOffsets()));
+
+    Map<TopicPartition, Offset> offsets = Maps.newHashMap(dataOffsets);
 
     writers.clear();
-    sourceOffsets.clear();
+    dataOffsets.clear();
 
-    return new Committable(offsets, writeResults);
+    return new Committable(offsets, writeResults, tableDataOffsets);
   }
 
   @Override
   public void close() throws IOException {
     writers.values().forEach(RecordWriter::close);
     writers.clear();
-    sourceOffsets.clear();
+    dataOffsets.clear();
   }
 
   @Override
@@ -89,7 +99,7 @@ class Worker implements Writer, AutoCloseable {
   private void save(SinkRecord record) {
     // the consumer stores the offsets that corresponds to the next record to consume,
     // so increment the record offset by one
-    sourceOffsets.put(
+    dataOffsets.put(
         new TopicPartition(record.topic(), record.kafkaPartition()),
         new Offset(record.kafkaOffset() + 1, record.timestamp()));
 

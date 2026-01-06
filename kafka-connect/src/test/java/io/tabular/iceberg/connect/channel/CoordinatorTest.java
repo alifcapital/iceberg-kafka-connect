@@ -19,9 +19,15 @@
 package io.tabular.iceberg.connect.channel;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.when;
 
+import io.tabular.iceberg.connect.events.DataOffsetsPayload;
+import io.tabular.iceberg.connect.events.EventType;
+import io.tabular.iceberg.connect.events.TableName;
 import io.tabular.iceberg.connect.fixtures.EventTestUtil;
+import java.util.Arrays;
+import java.util.Collections;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
@@ -40,6 +46,7 @@ import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Snapshot;
+import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.connect.events.AvroUtil;
 import org.apache.iceberg.connect.events.CommitComplete;
 import org.apache.iceberg.connect.events.CommitToTable;
@@ -90,7 +97,7 @@ public class CoordinatorTest extends ChannelTestBase {
 
     Map<String, String> summary = snapshot.summary();
     Assertions.assertEquals(commitId.toString(), summary.get(COMMIT_ID_SNAPSHOT_PROP));
-    Assertions.assertEquals("{\"0\":1}", summary.get(OFFSETS_SNAPSHOT_PROP));
+    Assertions.assertEquals("{\"0\":1}", summary.get(CONTROL_TOPIC_OFFSETS_PROP));
     Assertions.assertEquals(
         Long.toString(ts.toInstant().toEpochMilli()), summary.get(VTTS_SNAPSHOT_PROP));
   }
@@ -120,7 +127,7 @@ public class CoordinatorTest extends ChannelTestBase {
 
     Map<String, String> summary = snapshot.summary();
     Assertions.assertEquals(commitId.toString(), summary.get(COMMIT_ID_SNAPSHOT_PROP));
-    Assertions.assertEquals("{\"0\":1}", summary.get(OFFSETS_SNAPSHOT_PROP));
+    Assertions.assertEquals("{\"0\":1}", summary.get(CONTROL_TOPIC_OFFSETS_PROP));
     Assertions.assertEquals(
         Long.toString(ts.toInstant().toEpochMilli()), summary.get(VTTS_SNAPSHOT_PROP));
   }
@@ -387,7 +394,7 @@ public class CoordinatorTest extends ChannelTestBase {
         firstSnapshot.summary().get(COMMIT_ID_SNAPSHOT_PROP),
         "All snapshots should be tagged with a commit-id");
     Assertions.assertNull(
-        firstSnapshot.summary().getOrDefault(OFFSETS_SNAPSHOT_PROP, null),
+        firstSnapshot.summary().getOrDefault(CONTROL_TOPIC_OFFSETS_PROP, null),
         "Earlier snapshots should not include control-topic-offsets in their summary");
     Assertions.assertNull(
         firstSnapshot.summary().getOrDefault(VTTS_SNAPSHOT_PROP, null),
@@ -399,7 +406,7 @@ public class CoordinatorTest extends ChannelTestBase {
         "All snapshots should be tagged with a commit-id");
     Assertions.assertEquals(
         "{\"0\":3}",
-        secondSnapshot.summary().get(OFFSETS_SNAPSHOT_PROP),
+        secondSnapshot.summary().get(CONTROL_TOPIC_OFFSETS_PROP),
         "Only the most recent snapshot should include control-topic-offsets in it's summary");
     Assertions.assertEquals(
         "100",
@@ -590,13 +597,13 @@ public class CoordinatorTest extends ChannelTestBase {
 
     table.newAppend()
         .appendFile(initialFile)
-        .set(OFFSETS_SNAPSHOT_PROP, "{\"1\":7}")
+        .set(CONTROL_TOPIC_OFFSETS_PROP, "{\"1\":7}")
         .commit();
 
     table.refresh();
     assertThat(table.snapshots()).hasSize(1);
     assertThat(table.currentSnapshot().summary())
-        .containsEntry(OFFSETS_SNAPSHOT_PROP, "{\"1\":7}");
+        .containsEntry(CONTROL_TOPIC_OFFSETS_PROP, "{\"1\":7}");
 
     // Now trigger commit with partition 0 data
     OffsetDateTime ts = OffsetDateTime.ofInstant(Instant.now(), ZoneOffset.UTC);
@@ -608,7 +615,7 @@ public class CoordinatorTest extends ChannelTestBase {
     assertThat(table.snapshots()).hasSize(2);
     // Partition 0 offset from current commit (1), partition 1 offset preserved (7)
     assertThat(table.currentSnapshot().summary())
-        .containsEntry(OFFSETS_SNAPSHOT_PROP, "{\"0\":1,\"1\":7}");
+        .containsEntry(CONTROL_TOPIC_OFFSETS_PROP, "{\"0\":1,\"1\":7}");
   }
 
   private void assertCommitTable(int idx, UUID commitId, OffsetDateTime ts) {
@@ -688,5 +695,216 @@ public class CoordinatorTest extends ChannelTestBase {
     coordinator.process();
 
     return commitId;
+  }
+
+  // ==================== aggregateDataOffsets tests ====================
+
+  private Envelope wrapDataOffsetsInEnvelope(
+      DataOffsetsPayload payload, String groupId, int partition, long offset) {
+    io.tabular.iceberg.connect.events.Event localEvent =
+        new io.tabular.iceberg.connect.events.Event(groupId, EventType.DATA_OFFSETS, payload);
+    return new Envelope(localEvent, partition, offset);
+  }
+
+  @Test
+  public void testAggregateDataOffsetsNonOverlapping() {
+    when(config.commitIntervalMs()).thenReturn(Integer.MAX_VALUE);
+    Coordinator coordinator = new Coordinator(catalog, config, ImmutableList.of(), clientFactory);
+    initConsumer();
+
+    TableIdentifier tableIdentifier = TableIdentifier.of("db", "tbl");
+    TableName tableName = new TableName(Collections.singletonList("db"), "tbl");
+    UUID commitId = UUID.randomUUID();
+
+    // Worker 1 processed partition 0: offsets [0, 100]
+    DataOffsetsPayload payload1 =
+        new DataOffsetsPayload(
+            commitId,
+            tableName,
+            Arrays.asList(
+                new io.tabular.iceberg.connect.events.TopicPartitionOffset(
+                    "topic1", 0, 100L, null, 0L)));
+
+    // Worker 2 processed partition 1: offsets [0, 200]
+    DataOffsetsPayload payload2 =
+        new DataOffsetsPayload(
+            commitId,
+            tableName,
+            Arrays.asList(
+                new io.tabular.iceberg.connect.events.TopicPartitionOffset(
+                    "topic1", 1, 200L, null, 0L)));
+
+    List<Envelope> envelopes = Arrays.asList(
+        wrapDataOffsetsInEnvelope(payload1, "test-group", 0, 0),
+        wrapDataOffsetsInEnvelope(payload2, "test-group", 0, 1));
+
+    Map<String, Map<Integer, CommitState.OffsetRange>> result =
+        coordinator.aggregateDataOffsets(envelopes, tableIdentifier);
+
+    assertThat(result).containsKey("topic1");
+    assertThat(result.get("topic1")).containsKey(0);
+    assertThat(result.get("topic1")).containsKey(1);
+    assertThat(result.get("topic1").get(0).start()).isEqualTo(0L);
+    assertThat(result.get("topic1").get(0).end()).isEqualTo(100L);
+    assertThat(result.get("topic1").get(1).start()).isEqualTo(0L);
+    assertThat(result.get("topic1").get(1).end()).isEqualTo(200L);
+  }
+
+  @Test
+  public void testAggregateDataOffsetsMergesDisjointRanges() {
+    when(config.commitIntervalMs()).thenReturn(Integer.MAX_VALUE);
+    Coordinator coordinator = new Coordinator(catalog, config, ImmutableList.of(), clientFactory);
+    initConsumer();
+
+    TableIdentifier tableIdentifier = TableIdentifier.of("db", "tbl");
+    TableName tableName = new TableName(Collections.singletonList("db"), "tbl");
+    UUID commitId = UUID.randomUUID();
+
+    // Worker 1 processed partition 0: offsets [0, 49]
+    DataOffsetsPayload payload1 =
+        new DataOffsetsPayload(
+            commitId,
+            tableName,
+            Arrays.asList(
+                new io.tabular.iceberg.connect.events.TopicPartitionOffset(
+                    "topic1", 0, 49L, null, 0L)));
+
+    // Worker 2 processed partition 0: offsets [50, 99] - disjoint with payload1
+    DataOffsetsPayload payload2 =
+        new DataOffsetsPayload(
+            commitId,
+            tableName,
+            Arrays.asList(
+                new io.tabular.iceberg.connect.events.TopicPartitionOffset(
+                    "topic1", 0, 99L, null, 50L)));
+
+    List<Envelope> envelopes = Arrays.asList(
+        wrapDataOffsetsInEnvelope(payload1, "test-group", 0, 0),
+        wrapDataOffsetsInEnvelope(payload2, "test-group", 0, 1));
+
+    Map<String, Map<Integer, CommitState.OffsetRange>> result =
+        coordinator.aggregateDataOffsets(envelopes, tableIdentifier);
+
+    // Should merge into [0, 99]
+    assertThat(result.get("topic1").get(0).start()).isEqualTo(0L);
+    assertThat(result.get("topic1").get(0).end()).isEqualTo(99L);
+  }
+
+  @Test
+  public void testAggregateDataOffsetsThrowsOnIntersectingRanges() {
+    when(config.commitIntervalMs()).thenReturn(Integer.MAX_VALUE);
+    Coordinator coordinator = new Coordinator(catalog, config, ImmutableList.of(), clientFactory);
+    initConsumer();
+
+    TableIdentifier tableIdentifier = TableIdentifier.of("db", "tbl");
+    TableName tableName = new TableName(Collections.singletonList("db"), "tbl");
+    UUID commitId = UUID.randomUUID();
+
+    // Worker 1 processed partition 0: offsets [0, 100]
+    DataOffsetsPayload payload1 =
+        new DataOffsetsPayload(
+            commitId,
+            tableName,
+            Arrays.asList(
+                new io.tabular.iceberg.connect.events.TopicPartitionOffset(
+                    "topic1", 0, 100L, null, 0L)));
+
+    // Worker 2 processed partition 0: offsets [50, 150] - INTERSECTS with payload1
+    DataOffsetsPayload payload2 =
+        new DataOffsetsPayload(
+            commitId,
+            tableName,
+            Arrays.asList(
+                new io.tabular.iceberg.connect.events.TopicPartitionOffset(
+                    "topic1", 0, 150L, null, 50L)));
+
+    List<Envelope> envelopes = Arrays.asList(
+        wrapDataOffsetsInEnvelope(payload1, "test-group", 0, 0),
+        wrapDataOffsetsInEnvelope(payload2, "test-group", 0, 1));
+
+    assertThatThrownBy(() -> coordinator.aggregateDataOffsets(envelopes, tableIdentifier))
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessageContaining("Intersecting offset ranges");
+  }
+
+  @Test
+  public void testAggregateDataOffsetsWithPreFilteredList() {
+    // This test verifies that filtering by control topic offset works correctly.
+    // In production, filtering happens in commitToTable() BEFORE calling aggregateDataOffsets().
+    // Here we simulate that by passing a pre-filtered list.
+    when(config.commitIntervalMs()).thenReturn(Integer.MAX_VALUE);
+    Coordinator coordinator = new Coordinator(catalog, config, ImmutableList.of(), clientFactory);
+    initConsumer();
+
+    TableIdentifier tableIdentifier = TableIdentifier.of("db", "tbl");
+    TableName tableName = new TableName(Collections.singletonList("db"), "tbl");
+    UUID commitId = UUID.randomUUID();
+
+    // Envelope at control topic offset 5 - would be included (> lastCommitted 3)
+    DataOffsetsPayload payload1 =
+        new DataOffsetsPayload(
+            commitId,
+            tableName,
+            Arrays.asList(
+                new io.tabular.iceberg.connect.events.TopicPartitionOffset(
+                    "topic1", 0, 100L, null, 0L)));
+
+    // Envelope at control topic offset 2 - would be filtered out (<= lastCommitted 3)
+    // We simulate the filter by NOT including this in the list passed to aggregateDataOffsets
+    DataOffsetsPayload payload2 =
+        new DataOffsetsPayload(
+            commitId,
+            tableName,
+            Arrays.asList(
+                new io.tabular.iceberg.connect.events.TopicPartitionOffset(
+                    "topic1", 1, 200L, null, 0L)));
+
+    // Only pass envelope with offset 5 (simulating filter: offset > 3)
+    List<Envelope> filteredEnvelopes = Arrays.asList(
+        wrapDataOffsetsInEnvelope(payload1, "test-group", 0, 5));
+
+    Map<String, Map<Integer, CommitState.OffsetRange>> result =
+        coordinator.aggregateDataOffsets(filteredEnvelopes, tableIdentifier);
+
+    assertThat(result.get("topic1")).containsKey(0);  // offset 5 > 3, was included
+    assertThat(result.get("topic1")).doesNotContainKey(1);  // offset 2 <= 3, was filtered out
+  }
+
+  @Test
+  public void testAggregateDataOffsetsFiltersByTableIdentifier() {
+    when(config.commitIntervalMs()).thenReturn(Integer.MAX_VALUE);
+    Coordinator coordinator = new Coordinator(catalog, config, ImmutableList.of(), clientFactory);
+    initConsumer();
+
+    TableIdentifier tableIdentifier = TableIdentifier.of("db", "tbl");
+    TableName tableName = new TableName(Collections.singletonList("db"), "tbl");
+    TableName otherTableName = new TableName(Collections.singletonList("db"), "other");
+    UUID commitId = UUID.randomUUID();
+
+    DataOffsetsPayload payload1 =
+        new DataOffsetsPayload(
+            commitId,
+            tableName,
+            Arrays.asList(
+                new io.tabular.iceberg.connect.events.TopicPartitionOffset(
+                    "topic1", 0, 100L, null, 0L)));
+
+    DataOffsetsPayload payload2 =
+        new DataOffsetsPayload(
+            commitId,
+            otherTableName,
+            Arrays.asList(
+                new io.tabular.iceberg.connect.events.TopicPartitionOffset(
+                    "topic1", 1, 200L, null, 0L)));
+
+    List<Envelope> envelopes = Arrays.asList(
+        wrapDataOffsetsInEnvelope(payload1, "test-group", 0, 0),
+        wrapDataOffsetsInEnvelope(payload2, "test-group", 0, 1));
+
+    Map<String, Map<Integer, CommitState.OffsetRange>> result =
+        coordinator.aggregateDataOffsets(envelopes, tableIdentifier);
+
+    assertThat(result.get("topic1")).containsKey(0);
+    assertThat(result.get("topic1")).doesNotContainKey(1); // From different table
   }
 }

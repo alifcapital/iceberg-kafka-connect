@@ -18,89 +18,66 @@
  */
 package io.tabular.iceberg.connect.events;
 
+import java.util.List;
+import java.util.UUID;
 import org.apache.avro.Schema;
 import org.apache.avro.SchemaBuilder;
 
-public class TopicPartitionOffset implements Element {
+/**
+ * Payload for DATA_OFFSETS event type. Contains data topic partition offsets (start and end)
+ * for a specific table, sent by workers to the coordinator for tracking data lineage.
+ */
+public class DataOffsetsPayload implements Payload {
 
-  private String topic;
-  private Integer partition;
-  private Long offset;
-  private Long timestamp;
-  private Long startOffset;
+  private UUID commitId;
+  private TableName tableName;
+  private List<TopicPartitionOffset> dataOffsets;
   private final Schema avroSchema;
 
   public static final Schema AVRO_SCHEMA =
       SchemaBuilder.builder()
-          .record(TopicPartitionOffset.class.getName())
+          .record(DataOffsetsPayload.class.getName())
           .fields()
-          .name("topic")
+          .name("commitId")
           .prop(FIELD_ID_PROP, DUMMY_FIELD_ID)
-          .type()
-          .stringType()
+          .type(UUID_SCHEMA)
           .noDefault()
-          .name("partition")
+          .name("tableName")
           .prop(FIELD_ID_PROP, DUMMY_FIELD_ID)
-          .type()
-          .intType()
+          .type(TableName.AVRO_SCHEMA)
           .noDefault()
-          .name("offset")
+          .name("dataOffsets")
           .prop(FIELD_ID_PROP, DUMMY_FIELD_ID)
           .type()
           .nullable()
-          .longType()
-          .noDefault()
-          .name("timestamp")
-          .prop(FIELD_ID_PROP, DUMMY_FIELD_ID)
-          .type()
-          .nullable()
-          .longType()
-          .noDefault()
-          .name("startOffset")
-          .prop(FIELD_ID_PROP, DUMMY_FIELD_ID)
-          .type()
-          .nullable()
-          .longType()
+          .array()
+          .items(TopicPartitionOffset.AVRO_SCHEMA)
           .noDefault()
           .endRecord();
 
   // Used by Avro reflection to instantiate this class when reading events
-  public TopicPartitionOffset(Schema avroSchema) {
+  public DataOffsetsPayload(Schema avroSchema) {
     this.avroSchema = avroSchema;
   }
 
-  public TopicPartitionOffset(String topic, int partition, Long offset, Long timestamp) {
-    this(topic, partition, offset, timestamp, null);
-  }
-
-  public TopicPartitionOffset(
-      String topic, int partition, Long offset, Long timestamp, Long startOffset) {
-    this.topic = topic;
-    this.partition = partition;
-    this.offset = offset;
-    this.timestamp = timestamp;
-    this.startOffset = startOffset;
+  public DataOffsetsPayload(
+      UUID commitId, TableName tableName, List<TopicPartitionOffset> dataOffsets) {
+    this.commitId = commitId;
+    this.tableName = tableName;
+    this.dataOffsets = dataOffsets;
     this.avroSchema = AVRO_SCHEMA;
   }
 
-  public String topic() {
-    return topic;
+  public UUID commitId() {
+    return commitId;
   }
 
-  public Integer partition() {
-    return partition;
+  public TableName tableName() {
+    return tableName;
   }
 
-  public Long offset() {
-    return offset;
-  }
-
-  public Long timestamp() {
-    return timestamp;
-  }
-
-  public Long startOffset() {
-    return startOffset;
+  public List<TopicPartitionOffset> dataOffsets() {
+    return dataOffsets;
   }
 
   @Override
@@ -109,22 +86,17 @@ public class TopicPartitionOffset implements Element {
   }
 
   @Override
+  @SuppressWarnings("unchecked")
   public void put(int i, Object v) {
     switch (i) {
       case 0:
-        this.topic = v == null ? null : v.toString();
+        this.commitId = (UUID) v;
         return;
       case 1:
-        this.partition = (Integer) v;
+        this.tableName = (TableName) v;
         return;
       case 2:
-        this.offset = (Long) v;
-        return;
-      case 3:
-        this.timestamp = (Long) v;
-        return;
-      case 4:
-        this.startOffset = (Long) v;
+        this.dataOffsets = (List<TopicPartitionOffset>) v;
         return;
       default:
         // ignore the object, it must be from a newer version of the format
@@ -135,15 +107,11 @@ public class TopicPartitionOffset implements Element {
   public Object get(int i) {
     switch (i) {
       case 0:
-        return topic;
+        return commitId;
       case 1:
-        return partition;
+        return tableName;
       case 2:
-        return offset;
-      case 3:
-        return timestamp;
-      case 4:
-        return startOffset;
+        return dataOffsets;
       default:
         throw new UnsupportedOperationException("Unknown field ordinal: " + i);
     }

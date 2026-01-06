@@ -28,6 +28,7 @@ import io.tabular.iceberg.connect.events.CommitResponsePayload;
 import io.tabular.iceberg.connect.events.CommitTablePayload;
 import io.tabular.iceberg.connect.events.EventTestUtil;
 import io.tabular.iceberg.connect.events.EventType;
+import io.tabular.iceberg.connect.events.DataOffsetsPayload;
 import io.tabular.iceberg.connect.events.TableName;
 import io.tabular.iceberg.connect.events.TopicPartitionOffset;
 import java.time.Instant;
@@ -69,7 +70,7 @@ public class EventDecoderTest {
 
     byte[] data = io.tabular.iceberg.connect.events.Event.encode(event);
 
-    Event result = eventDecoder.decode(data);
+    Event result = eventDecoder.decodeEvent(data);
 
     assertThat(result.groupId()).isEqualTo("cg-connector");
     assertThat(result.type()).isEqualTo(PayloadType.START_COMMIT);
@@ -93,7 +94,7 @@ public class EventDecoderTest {
 
     byte[] data = io.tabular.iceberg.connect.events.Event.encode(event);
 
-    Event result = eventDecoder.decode(data);
+    Event result = eventDecoder.decodeEvent(data);
 
     assertThat(result.groupId()).isEqualTo("cg-connector");
     assertThat(result.type()).isEqualTo(PayloadType.DATA_WRITTEN);
@@ -153,7 +154,7 @@ public class EventDecoderTest {
 
     byte[] data = io.tabular.iceberg.connect.events.Event.encode(event);
 
-    Event result = eventDecoder.decode(data);
+    Event result = eventDecoder.decodeEvent(data);
 
     assertThat(event.groupId()).isEqualTo("cg-connector");
     assertThat(result.type()).isEqualTo(PayloadType.DATA_WRITTEN);
@@ -194,7 +195,7 @@ public class EventDecoderTest {
 
     byte[] data = io.tabular.iceberg.connect.events.Event.encode(event);
 
-    Event result = eventDecoder.decode(data);
+    Event result = eventDecoder.decodeEvent(data);
     assertThat(event.groupId()).isEqualTo("cg-connector");
 
     assertThat(result.type()).isEqualTo(PayloadType.DATA_COMPLETE);
@@ -225,7 +226,7 @@ public class EventDecoderTest {
 
     byte[] data = io.tabular.iceberg.connect.events.Event.encode(event);
 
-    Event result = eventDecoder.decode(data);
+    Event result = eventDecoder.decodeEvent(data);
     assertThat(event.groupId()).isEqualTo("cg-connector");
     assertThat(result.type()).isEqualTo(PayloadType.COMMIT_TO_TABLE);
     assertThat(result.payload()).isInstanceOf(CommitToTable.class);
@@ -250,7 +251,7 @@ public class EventDecoderTest {
 
     byte[] data = io.tabular.iceberg.connect.events.Event.encode(event);
 
-    Event result = eventDecoder.decode(data);
+    Event result = eventDecoder.decodeEvent(data);
     assertThat(event.groupId()).isEqualTo("cg-connector");
     assertThat(result.type()).isEqualTo(PayloadType.COMMIT_TO_TABLE);
     assertThat(result.payload()).isInstanceOf(CommitToTable.class);
@@ -271,7 +272,7 @@ public class EventDecoderTest {
 
     byte[] data = io.tabular.iceberg.connect.events.Event.encode(event);
 
-    Event result = eventDecoder.decode(data);
+    Event result = eventDecoder.decodeEvent(data);
     assertThat(result.type()).isEqualTo(PayloadType.COMMIT_COMPLETE);
     assertThat(result.payload()).isInstanceOf(CommitComplete.class);
     CommitComplete payload = (CommitComplete) result.payload();
@@ -288,11 +289,56 @@ public class EventDecoderTest {
 
     byte[] data = io.tabular.iceberg.connect.events.Event.encode(event);
 
-    Event result = eventDecoder.decode(data);
+    Event result = eventDecoder.decodeEvent(data);
     assertThat(result.type()).isEqualTo(PayloadType.COMMIT_COMPLETE);
     assertThat(result.payload()).isInstanceOf(CommitComplete.class);
     CommitComplete payload = (CommitComplete) result.payload();
     assertThat(payload.commitId()).isEqualTo(commitId);
     assertThat(payload.validThroughTs()).isNull();
+  }
+
+  @Test
+  public void testDataOffsetsDecoding() {
+    TableName tableName = new TableName(Collections.singletonList("db"), "tbl");
+    io.tabular.iceberg.connect.events.Event event =
+        new io.tabular.iceberg.connect.events.Event(
+            "cg-connector",
+            EventType.DATA_OFFSETS,
+            new DataOffsetsPayload(
+                commitId,
+                tableName,
+                Arrays.asList(
+                    new TopicPartitionOffset("topic1", 0, 100L, null, 0L),
+                    new TopicPartitionOffset("topic1", 1, 200L, 1000L, 50L))));
+
+    byte[] data = io.tabular.iceberg.connect.events.Event.encode(event);
+
+    Envelope envelope = eventDecoder.decode(data, 0, 123L);
+
+    assertThat(envelope).isNotNull();
+    assertThat(envelope.isLocalEvent()).isTrue();
+    assertThat(envelope.localEventType()).isEqualTo(EventType.DATA_OFFSETS);
+    assertThat(envelope.groupId()).isEqualTo("cg-connector");
+    assertThat(envelope.partition()).isEqualTo(0);
+    assertThat(envelope.offset()).isEqualTo(123L);
+
+    DataOffsetsPayload payload = (DataOffsetsPayload) envelope.localEvent().payload();
+    assertThat(payload.commitId()).isEqualTo(commitId);
+    assertThat(payload.tableName().toIdentifier()).isEqualTo(TableIdentifier.of("db", "tbl"));
+    assertThat(payload.dataOffsets()).hasSize(2);
+
+    TopicPartitionOffset tpo0 = payload.dataOffsets().get(0);
+    assertThat(tpo0.topic()).isEqualTo("topic1");
+    assertThat(tpo0.partition()).isEqualTo(0);
+    assertThat(tpo0.offset()).isEqualTo(100L);
+    assertThat(tpo0.timestamp()).isNull();
+    assertThat(tpo0.startOffset()).isEqualTo(0L);
+
+    TopicPartitionOffset tpo1 = payload.dataOffsets().get(1);
+    assertThat(tpo1.topic()).isEqualTo("topic1");
+    assertThat(tpo1.partition()).isEqualTo(1);
+    assertThat(tpo1.offset()).isEqualTo(200L);
+    assertThat(tpo1.timestamp()).isEqualTo(1000L);
+    assertThat(tpo1.startOffset()).isEqualTo(50L);
   }
 }

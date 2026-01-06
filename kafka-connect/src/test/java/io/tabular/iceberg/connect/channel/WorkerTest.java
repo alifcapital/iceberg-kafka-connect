@@ -27,6 +27,7 @@ import static org.mockito.Mockito.when;
 import io.tabular.iceberg.connect.IcebergSinkConfig;
 import io.tabular.iceberg.connect.data.IcebergWriter;
 import io.tabular.iceberg.connect.data.IcebergWriterFactory;
+import io.tabular.iceberg.connect.data.WriteComplete;
 import io.tabular.iceberg.connect.data.WriterResult;
 import io.tabular.iceberg.connect.events.EventTestUtil;
 import java.util.Map;
@@ -69,8 +70,10 @@ public class WorkerTest {
             ImmutableList.of(EventTestUtil.createDataFile()),
             ImmutableList.of(),
             StructType.of());
+    WriteComplete writeComplete =
+        new WriteComplete(ImmutableList.of(writeResult), ImmutableMap.of());
     IcebergWriter writer = mock(IcebergWriter.class);
-    when(writer.complete()).thenReturn(ImmutableList.of(writeResult));
+    when(writer.complete()).thenReturn(writeComplete);
 
     IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
     when(writerFactory.createWriter(any(), any(), anyBoolean())).thenReturn(writer);

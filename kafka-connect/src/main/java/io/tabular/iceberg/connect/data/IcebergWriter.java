@@ -24,12 +24,15 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.io.TaskWriter;
 import org.apache.iceberg.io.WriteResult;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.connect.errors.DataException;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.slf4j.Logger;
@@ -43,6 +46,7 @@ public class IcebergWriter implements RecordWriter {
   private final String tableName;
   private final IcebergSinkConfig config;
   private final List<WriterResult> writerResults;
+  private final Map<TopicPartition, Offset> dataOffsets;
 
   private RecordConverter recordConverter;
   private TaskWriter<Record> writer;
@@ -52,6 +56,7 @@ public class IcebergWriter implements RecordWriter {
     this.tableName = tableName;
     this.config = config;
     this.writerResults = Lists.newArrayList();
+    this.dataOffsets = Maps.newHashMap();
     initNewWriter();
   }
 
@@ -73,6 +78,7 @@ public class IcebergWriter implements RecordWriter {
           Operation op = extractCdcOperation(record.value(), cdcField);
           writer.write(new RecordWrapper(row, op));
         }
+        trackDataOffset(record);
       }
     } catch (Exception e) {
       throw new DataException(
@@ -80,6 +86,18 @@ public class IcebergWriter implements RecordWriter {
               "An error occurred converting record, topic: %s, partition, %d, offset: %d",
               record.topic(), record.kafkaPartition(), record.kafkaOffset()),
           e);
+    }
+  }
+
+  private void trackDataOffset(SinkRecord record) {
+    TopicPartition tp = new TopicPartition(record.topic(), record.kafkaPartition());
+    Offset existing = dataOffsets.get(tp);
+    if (existing == null) {
+      // First record: start=current, end=current → range [100, 100]
+      dataOffsets.put(tp, new Offset(record.kafkaOffset(), record.timestamp(), record.kafkaOffset()));
+    } else {
+      // Subsequent: keep start, update end → range [100, 105]
+      dataOffsets.put(tp, new Offset(record.kafkaOffset(), record.timestamp(), existing.startOffset()));
     }
   }
 
@@ -147,11 +165,13 @@ public class IcebergWriter implements RecordWriter {
   }
 
   @Override
-  public synchronized List<WriterResult> complete() {
+  public synchronized WriteComplete complete() {
     flush();
 
-    List<WriterResult> result = Lists.newArrayList(writerResults);
+    WriteComplete result =
+        new WriteComplete(Lists.newArrayList(writerResults), Maps.newHashMap(dataOffsets));
     writerResults.clear();
+    dataOffsets.clear();
 
     return result;
   }

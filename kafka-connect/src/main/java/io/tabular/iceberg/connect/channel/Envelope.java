@@ -18,21 +18,65 @@
  */
 package io.tabular.iceberg.connect.channel;
 
+import io.tabular.iceberg.connect.events.EventType;
 import org.apache.iceberg.connect.events.Event;
 
+/**
+ * Wrapper for control topic messages. Contains either an Iceberg Event or a local Event.
+ */
 public class Envelope {
   private final Event event;
+  private final io.tabular.iceberg.connect.events.Event localEvent;
   private final int partition;
   private final long offset;
 
+  /** Constructor for Iceberg Events (DataWritten, DataComplete, etc.) */
   public Envelope(Event event, int partition, long offset) {
+    this(event, null, partition, offset);
+  }
+
+  /** Constructor for local Events (DATA_OFFSETS, legacy events before conversion) */
+  public Envelope(io.tabular.iceberg.connect.events.Event localEvent, int partition, long offset) {
+    this(null, localEvent, partition, offset);
+  }
+
+  private Envelope(
+      Event event,
+      io.tabular.iceberg.connect.events.Event localEvent,
+      int partition,
+      long offset) {
     this.event = event;
+    this.localEvent = localEvent;
     this.partition = partition;
     this.offset = offset;
   }
 
+  /** Returns the Iceberg Event, or null if this is a local event. */
   public Event event() {
     return event;
+  }
+
+  /** Returns the local Event, or null if this is an Iceberg event. */
+  public io.tabular.iceberg.connect.events.Event localEvent() {
+    return localEvent;
+  }
+
+  /** Returns true if this envelope contains a local event (not an Iceberg event). */
+  public boolean isLocalEvent() {
+    return localEvent != null;
+  }
+
+  /** Returns the local event type, or null if this is an Iceberg event. */
+  public EventType localEventType() {
+    return localEvent != null ? localEvent.type() : null;
+  }
+
+  /** Returns the groupId from either the Iceberg event or local event. */
+  public String groupId() {
+    if (localEvent != null) {
+      return localEvent.groupId();
+    }
+    return event != null ? event.groupId() : null;
   }
 
   public int partition() {

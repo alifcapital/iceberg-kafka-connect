@@ -23,14 +23,19 @@ import static java.util.stream.Collectors.toMap;
 
 import io.tabular.iceberg.connect.IcebergSinkConfig;
 import io.tabular.iceberg.connect.data.Offset;
+import io.tabular.iceberg.connect.events.EventType;
+import io.tabular.iceberg.connect.events.DataOffsetsPayload;
+import io.tabular.iceberg.connect.events.TableName;
 import java.io.IOException;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import org.apache.iceberg.catalog.Catalog;
+import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.connect.events.DataComplete;
 import org.apache.iceberg.connect.events.DataWritten;
 import org.apache.iceberg.connect.events.Event;
@@ -42,6 +47,7 @@ import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTest
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.kafka.clients.admin.ListConsumerGroupOffsetsOptions;
 import org.apache.kafka.clients.admin.ListConsumerGroupOffsetsResult;
 import org.apache.kafka.clients.consumer.ConsumerGroupMetadata;
@@ -105,7 +111,7 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
             receive(
                 envelope,
                 // CommittableSupplier that always returns empty committables
-                () -> new Committable(ImmutableMap.of(), ImmutableList.of())));
+                () -> new Committable(ImmutableMap.of(), ImmutableList.of(), ImmutableMap.of())));
   }
 
   private Map<TopicPartition, Long> fetchStableConsumerOffsets(String groupId) {
@@ -129,7 +135,7 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
   }
 
   private boolean receive(Envelope envelope, CommittableSupplier committableSupplier) {
-    if (envelope.event().type() == PayloadType.START_COMMIT) {
+    if (!envelope.isLocalEvent() && envelope.event().type() == PayloadType.START_COMMIT) {
       UUID commitId = ((StartCommit) envelope.event().payload()).commitId();
       sendCommitResponse(commitId, committableSupplier);
       return true;
@@ -141,11 +147,16 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
     Committable committable = committableSupplier.committable();
 
     List<Event> events = Lists.newArrayList();
+    List<io.tabular.iceberg.connect.events.Event> localEvents = Lists.newArrayList();
 
+    // Collect unique tables from writer results
+    Set<TableIdentifier> tables = Sets.newHashSet();
     committable
         .writerResults()
         .forEach(
             writerResult -> {
+              tables.add(writerResult.tableIdentifier());
+
               Event commitResponse =
                   new Event(
                       config.controlGroupId(),
@@ -158,6 +169,32 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
 
               events.add(commitResponse);
             });
+
+    // Send data offsets for each table (one event per table)
+    if (!committable.dataOffsets().isEmpty()) {
+      List<io.tabular.iceberg.connect.events.TopicPartitionOffset> dataOffsetsList =
+          committable.dataOffsets().entrySet().stream()
+              .map(
+                  entry ->
+                      new io.tabular.iceberg.connect.events.TopicPartitionOffset(
+                          entry.getKey().topic(),
+                          entry.getKey().partition(),
+                          entry.getValue().offset(),
+                          entry.getValue().timestamp() != null
+                              ? entry.getValue().timestamp().toInstant().toEpochMilli()
+                              : null,
+                          entry.getValue().startOffset()))
+              .collect(toList());
+
+      for (TableIdentifier tableId : tables) {
+        DataOffsetsPayload dataOffsetsPayload =
+            new DataOffsetsPayload(commitId, TableName.of(tableId), dataOffsetsList);
+
+        localEvents.add(
+            new io.tabular.iceberg.connect.events.Event(
+                config.controlGroupId(), EventType.DATA_OFFSETS, dataOffsetsPayload));
+      }
+    }
 
     // include all assigned topic partitions even if no messages were read
     // from a partition, as the coordinator will use that to determine
@@ -183,8 +220,8 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
     events.add(commitReady);
 
     Map<TopicPartition, Offset> offsets = committable.offsetsByTopicPartition();
-    send(events, offsets, new ConsumerGroupMetadata(config.controlGroupId()));
-    send(ImmutableList.of(), offsets, new ConsumerGroupMetadata(config.connectGroupId()));
+    send(events, localEvents, offsets, new ConsumerGroupMetadata(config.controlGroupId()));
+    send(ImmutableList.of(), ImmutableList.of(), offsets, new ConsumerGroupMetadata(config.connectGroupId()));
   }
 
   @Override

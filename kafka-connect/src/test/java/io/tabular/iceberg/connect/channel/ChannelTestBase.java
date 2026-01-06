@@ -83,7 +83,7 @@ public class ChannelTestBase {
           required(3, "date", Types.StringType.get()));
 
   protected static final String COMMIT_ID_SNAPSHOT_PROP = "kafka.connect.commit-id";
-  protected static final String OFFSETS_SNAPSHOT_PROP =
+  protected static final String CONTROL_TOPIC_OFFSETS_PROP =
       String.format("kafka.connect.offsets.%s.%s", CTL_TOPIC_NAME, CONTROL_CONSUMER_GROUP_ID);
   protected static final String VTTS_SNAPSHOT_PROP = "kafka.connect.vtts";
 

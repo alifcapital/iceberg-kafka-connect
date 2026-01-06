@@ -28,16 +28,26 @@ public class Offset {
 
   private final Long offset;
   private final Long timestamp;
+  private final Long startOffset;
 
   public Offset(Long offset, Long timestamp) {
+    this(offset, timestamp, null);
+  }
+
+  public Offset(Long offset, Long timestamp, Long startOffset) {
     Preconditions.checkNotNull(offset, "offset cannot be null");
 
     this.offset = offset;
     this.timestamp = timestamp;
+    this.startOffset = startOffset;
   }
 
   public Long offset() {
     return offset;
+  }
+
+  public Long startOffset() {
+    return startOffset;
   }
 
   public OffsetDateTime timestamp() {
@@ -56,16 +66,25 @@ public class Offset {
       return false;
     }
     Offset offset1 = (Offset) o;
-    return Objects.equals(offset, offset1.offset) && Objects.equals(timestamp, offset1.timestamp);
+    return Objects.equals(offset, offset1.offset)
+        && Objects.equals(timestamp, offset1.timestamp)
+        && Objects.equals(startOffset, offset1.startOffset);
   }
 
   @Override
   public int hashCode() {
-    return Objects.hash(offset, timestamp);
+    return Objects.hash(offset, timestamp, startOffset);
   }
 
   @Override
   public String toString() {
-    return "Offset{" + "offset=" + offset + ", timestamp=" + timestamp + '}';
+    return "Offset{"
+        + "offset="
+        + offset
+        + ", timestamp="
+        + timestamp
+        + ", startOffset="
+        + startOffset
+        + '}';
   }
 }

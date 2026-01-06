@@ -18,17 +18,29 @@
  */
 package io.tabular.iceberg.connect.data;
 
+import java.util.List;
+import java.util.Map;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
-import org.apache.kafka.connect.sink.SinkRecord;
+import org.apache.kafka.common.TopicPartition;
 
-public interface RecordWriter extends Cloneable {
+/** Result of completing a write operation, containing file results and data offsets. */
+public class WriteComplete {
 
-  default void write(SinkRecord record) {}
+  private final ImmutableList<WriterResult> writerResults;
+  private final ImmutableMap<TopicPartition, Offset> dataOffsets;
 
-  default WriteComplete complete() {
-    return new WriteComplete(ImmutableList.of(), ImmutableMap.of());
+  public WriteComplete(
+      List<WriterResult> writerResults, Map<TopicPartition, Offset> dataOffsets) {
+    this.writerResults = ImmutableList.copyOf(writerResults);
+    this.dataOffsets = ImmutableMap.copyOf(dataOffsets);
   }
 
-  default void close() {}
+  public List<WriterResult> writerResults() {
+    return writerResults;
+  }
+
+  public Map<TopicPartition, Offset> dataOffsets() {
+    return dataOffsets;
+  }
 }

@@ -26,6 +26,8 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.tabular.iceberg.connect.IcebergSinkConfig;
 import io.tabular.iceberg.connect.data.PartitionStatsManager;
+import io.tabular.iceberg.connect.events.DataOffsetsPayload;
+import io.tabular.iceberg.connect.events.EventType;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.time.Duration;
@@ -79,15 +81,16 @@ public class Coordinator extends Channel implements AutoCloseable {
 
   private static final Logger LOG = LoggerFactory.getLogger(Coordinator.class);
   private static final ObjectMapper MAPPER = new ObjectMapper();
-  private static final String OFFSETS_SNAPSHOT_PROP_FMT = "kafka.connect.offsets.%s.%s";
+  private static final String CONTROL_TOPIC_OFFSETS_PROP_FMT = "kafka.connect.offsets.%s.%s";
   private static final String COMMIT_ID_SNAPSHOT_PROP = "kafka.connect.commit-id";
   private static final String VTTS_SNAPSHOT_PROP = "kafka.connect.vtts";
+  private static final String DATA_OFFSETS_SNAPSHOT_PROP = "kafka.connect.data-offsets";
   private static final Duration POLL_DURATION = Duration.ofMillis(1000);
 
   private final Catalog catalog;
   private final IcebergSinkConfig config;
   private final int totalPartitionCount;
-  private final String snapshotOffsetsProp;
+  private final String controlTopicOffsetsProp;
   private final ExecutorService exec;
   private final CommitState commitState;
   private volatile boolean terminated;
@@ -104,8 +107,8 @@ public class Coordinator extends Channel implements AutoCloseable {
     this.config = config;
     this.totalPartitionCount =
         members.stream().mapToInt(desc -> desc.assignment().topicPartitions().size()).sum();
-    this.snapshotOffsetsProp =
-        String.format(OFFSETS_SNAPSHOT_PROP_FMT, config.controlTopic(), config.controlGroupId());
+    this.controlTopicOffsetsProp =
+        String.format(CONTROL_TOPIC_OFFSETS_PROP_FMT, config.controlTopic(), config.controlGroupId());
     this.exec = ThreadPools.newWorkerPool("iceberg-committer", config.commitThreads());
     this.commitState = new CommitState(config);
 
@@ -133,6 +136,16 @@ public class Coordinator extends Channel implements AutoCloseable {
   }
 
   private boolean receive(Envelope envelope) {
+    // Handle local events (DATA_OFFSETS, etc.)
+    if (envelope.isLocalEvent()) {
+      if (envelope.localEventType() == EventType.DATA_OFFSETS) {
+        commitState.addDataOffsets(envelope);
+        return true;
+      }
+      return false;
+    }
+
+    // Handle standard Iceberg events
     switch (envelope.event().type()) {
       case DATA_WRITTEN:
         commitState.addResponse(envelope);
@@ -333,13 +346,22 @@ public class Coordinator extends Channel implements AutoCloseable {
     }
     Optional<String> branch = tableBranch.second();
 
-    CommittedInfo committedInfo = lastCommittedInfo(table, branch.orElse(null));
-    UUID lastCommittedCommit = committedInfo.commitId;
-    Map<Integer, Long> lastCommittedOffsets = committedInfo.offsets;
+    SnapshotCommitMetadata commitMetadata = lastSnapshotCommitMetadata(table, branch.orElse(null));
+    Map<Integer, Long> lastControlTopicOffsets = commitMetadata.controlTopicOffsets;
+    Map<String, Map<Integer, CommitState.OffsetRange>> lastDataOffsets = commitMetadata.dataOffsets;
 
+    // Filter DATA_WRITTEN by control topic offset
     List<Envelope> filteredEnvelopeList = envelopeList.stream()
       .filter(envelope -> {
-        Long minOffset = lastCommittedOffsets.get(envelope.partition());
+        Long minOffset = lastControlTopicOffsets.get(envelope.partition());
+        return minOffset == null || envelope.offset() > minOffset;
+      })
+      .collect(toList());
+
+    // Filter DATA_OFFSETS by control topic offset (same logic as DATA_WRITTEN)
+    List<Envelope> filteredDataOffsets = commitState.dataOffsetsBuffer().stream()
+      .filter(envelope -> {
+        Long minOffset = lastControlTopicOffsets.get(envelope.partition());
         return minOffset == null || envelope.offset() > minOffset;
       })
       .collect(toList());
@@ -358,7 +380,7 @@ public class Coordinator extends Channel implements AutoCloseable {
 
     // Merge last committed offsets with current offsets, taking max for conflicts
     Map<Integer, Long> mergedOffsets =
-        java.util.stream.Stream.of(lastCommittedOffsets, currentOffsets)
+        java.util.stream.Stream.of(lastControlTopicOffsets, currentOffsets)
             .flatMap(map -> map.entrySet().stream())
             .collect(toMap(
                 Map.Entry::getKey,
@@ -367,10 +389,17 @@ public class Coordinator extends Channel implements AutoCloseable {
 
     String offsetsJson;
     try {
-        offsetsJson = MAPPER.writeValueAsString(mergedOffsets);
+      offsetsJson = MAPPER.writeValueAsString(mergedOffsets);
     } catch (IOException e) {
-        throw new UncheckedIOException(e);
+      throw new UncheckedIOException(e);
     }
+
+    // Aggregate DATA_OFFSETS for this table
+    Map<String, Map<Integer, CommitState.OffsetRange>> currentDataOffsets =
+        aggregateDataOffsets(filteredDataOffsets, tableIdentifier);
+    Map<String, Map<Integer, CommitState.OffsetRange>> mergedDataOffsets =
+        mergeDataOffsets(lastDataOffsets, currentDataOffsets);
+    String dataOffsetsJson = serializeDataOffsets(mergedDataOffsets);
 
     List<DataFile> dataFiles =
         Deduplicated.dataFiles(commitState.currentCommitId(), tableIdentifier, filteredEnvelopeList)
@@ -408,7 +437,10 @@ public class Coordinator extends Channel implements AutoCloseable {
           list.get(i).forEach(appendOp::appendFile);
           appendOp.set(COMMIT_ID_SNAPSHOT_PROP, commitState.currentCommitId().toString());
           if (i == lastIdx) {
-            appendOp.set(snapshotOffsetsProp, offsetsJson);
+            appendOp.set(controlTopicOffsetsProp, offsetsJson);
+            if (dataOffsetsJson != null) {
+              appendOp.set(DATA_OFFSETS_SNAPSHOT_PROP, dataOffsetsJson);
+            }
             if (vtts != null) {
               appendOp.set(VTTS_SNAPSHOT_PROP, Long.toString(vtts.toInstant().toEpochMilli()));
             }
@@ -421,8 +453,11 @@ public class Coordinator extends Channel implements AutoCloseable {
       } else {
         RowDelta deltaOp = table.newRowDelta();
         branch.ifPresent(deltaOp::toBranch);
-        deltaOp.set(snapshotOffsetsProp, offsetsJson);
+        deltaOp.set(controlTopicOffsetsProp, offsetsJson);
         deltaOp.set(COMMIT_ID_SNAPSHOT_PROP, commitState.currentCommitId().toString());
+        if (dataOffsetsJson != null) {
+          deltaOp.set(DATA_OFFSETS_SNAPSHOT_PROP, dataOffsetsJson);
+        }
         if (vtts != null) {
           deltaOp.set(VTTS_SNAPSHOT_PROP, Long.toString(vtts.toInstant().toEpochMilli()));
         }
@@ -498,41 +533,198 @@ public class Coordinator extends Channel implements AutoCloseable {
     return table.snapshot(branch);
   }
 
-  private static class CommittedInfo {
-    final UUID commitId;
-    final Map<Integer, Long> offsets;
+  /**
+   * Aggregates DATA_OFFSETS for a specific table. Merges non-overlapping ranges,
+   * throws on intersecting ranges.
+   */
+  Map<String, Map<Integer, CommitState.OffsetRange>> aggregateDataOffsets(
+      List<Envelope> filteredDataOffsets, TableIdentifier tableIdentifier) {
+    Map<String, Map<Integer, CommitState.OffsetRange>> result = Maps.newHashMap();
 
-    CommittedInfo(UUID commitId, Map<Integer, Long> offsets) {
-        this.commitId = commitId;
-        this.offsets = offsets;
+    for (Envelope envelope : filteredDataOffsets) {
+      DataOffsetsPayload payload = (DataOffsetsPayload) envelope.localEvent().payload();
+      if (!payload.tableName().toIdentifier().equals(tableIdentifier)) {
+        continue;
+      }
+
+      for (io.tabular.iceberg.connect.events.TopicPartitionOffset tpo : payload.dataOffsets()) {
+        String topic = tpo.topic();
+        Integer partition = tpo.partition();
+        CommitState.OffsetRange incoming =
+            new CommitState.OffsetRange(
+                tpo.startOffset() != null ? tpo.startOffset() : tpo.offset(), tpo.offset());
+
+        Map<Integer, CommitState.OffsetRange> partitionMap =
+            result.computeIfAbsent(topic, k -> Maps.newHashMap());
+        CommitState.OffsetRange existing = partitionMap.get(partition);
+
+        if (existing != null) {
+          // Check for intersection: [a, b] and [c, d] intersect if !(b < c || d < a)
+          boolean intersects = !(existing.end() < incoming.start() || incoming.end() < existing.start());
+          if (intersects) {
+            throw new IllegalStateException(
+                String.format(
+                    "Intersecting offset ranges for topic=%s partition=%d: existing=[%d,%d] incoming=[%d,%d]",
+                    topic,
+                    partition,
+                    existing.start(),
+                    existing.end(),
+                    incoming.start(),
+                    incoming.end()));
+          }
+          // Merge non-overlapping ranges
+          partitionMap.put(
+              partition,
+              new CommitState.OffsetRange(
+                  Math.min(existing.start(), incoming.start()),
+                  Math.max(existing.end(), incoming.end())));
+        } else {
+          partitionMap.put(partition, incoming);
+        }
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * Merges source data offsets from previous snapshot with current offsets. Takes all entries from
+   * current and adds entries from previous that are not in current (propagation).
+   */
+  private Map<String, Map<Integer, CommitState.OffsetRange>> mergeDataOffsets(
+      Map<String, Map<Integer, CommitState.OffsetRange>> previous,
+      Map<String, Map<Integer, CommitState.OffsetRange>> current) {
+    Map<String, Map<Integer, CommitState.OffsetRange>> result = Maps.newHashMap();
+
+    // Add all current entries
+    for (Map.Entry<String, Map<Integer, CommitState.OffsetRange>> entry : current.entrySet()) {
+      result.put(entry.getKey(), Maps.newHashMap(entry.getValue()));
+    }
+
+    // Propagate missing (topic, partition) from previous
+    for (Map.Entry<String, Map<Integer, CommitState.OffsetRange>> entry : previous.entrySet()) {
+      String topic = entry.getKey();
+      Map<Integer, CommitState.OffsetRange> partitionMap =
+          result.computeIfAbsent(topic, k -> Maps.newHashMap());
+      for (Map.Entry<Integer, CommitState.OffsetRange> partitionEntry :
+          entry.getValue().entrySet()) {
+        // Only add if not present in current
+        partitionMap.putIfAbsent(partitionEntry.getKey(), partitionEntry.getValue());
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * Serializes data offsets to JSON format: {"topic": {"partition": {"start": X, "end": Y}, ...}}
+   */
+  private String serializeDataOffsets(
+      Map<String, Map<Integer, CommitState.OffsetRange>> dataOffsets) {
+    if (dataOffsets.isEmpty()) {
+      return null;
+    }
+    Map<String, Map<Integer, Map<String, Long>>> serializable = Maps.newHashMap();
+    for (Map.Entry<String, Map<Integer, CommitState.OffsetRange>> topicEntry :
+        dataOffsets.entrySet()) {
+      Map<Integer, Map<String, Long>> partitionMap = Maps.newHashMap();
+      for (Map.Entry<Integer, CommitState.OffsetRange> partitionEntry :
+          topicEntry.getValue().entrySet()) {
+        CommitState.OffsetRange range = partitionEntry.getValue();
+        Map<String, Long> rangeMap = Maps.newHashMap();
+        rangeMap.put("start", range.start());
+        rangeMap.put("end", range.end());
+        partitionMap.put(partitionEntry.getKey(), rangeMap);
+      }
+      serializable.put(topicEntry.getKey(), partitionMap);
+    }
+    try {
+      return MAPPER.writeValueAsString(serializable);
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
     }
   }
 
-  private CommittedInfo lastCommittedInfo(Table table, String branch) {
+  private static class SnapshotCommitMetadata {
+    final UUID commitId;
+    final Map<Integer, Long> controlTopicOffsets;
+    final Map<String, Map<Integer, CommitState.OffsetRange>> dataOffsets;
+
+    SnapshotCommitMetadata(
+        UUID commitId,
+        Map<Integer, Long> controlTopicOffsets,
+        Map<String, Map<Integer, CommitState.OffsetRange>> dataOffsets) {
+      this.commitId = commitId;
+      this.controlTopicOffsets = controlTopicOffsets;
+      this.dataOffsets = dataOffsets;
+    }
+  }
+
+  private SnapshotCommitMetadata lastSnapshotCommitMetadata(Table table, String branch) {
     Snapshot snapshot = latestSnapshot(table, branch);
     while (snapshot != null) {
-        Map<String, String> summary = snapshot.summary();
-        String commitIdValue = summary.get(COMMIT_ID_SNAPSHOT_PROP);
-        String offsetsValue = summary.get(snapshotOffsetsProp);
-
-        if (commitIdValue != null || offsetsValue != null) {
-            UUID commitId = commitIdValue != null ? UUID.fromString(commitIdValue) : null;
-            Map<Integer, Long> offsets = ImmutableMap.of();
-            if (offsetsValue != null) {
-                try {
-                    TypeReference<Map<Integer, Long>> typeRef = new TypeReference<Map<Integer, Long>>() {};
-                    offsets = MAPPER.readValue(offsetsValue, typeRef);
-                } catch (IOException e) {
-                    throw new UncheckedIOException(e);
-                }
-            }
-            return new CommittedInfo(commitId, offsets);
-        }
-
-        Long parentSnapshotId = snapshot.parentId();
-        snapshot = parentSnapshotId != null ? table.snapshot(parentSnapshotId) : null;
+      Map<String, String> summary = snapshot.summary();
+      if (hasCommitInfo(summary)) {
+        return parseSnapshotCommitMetadata(summary);
+      }
+      Long parentSnapshotId = snapshot.parentId();
+      snapshot = parentSnapshotId != null ? table.snapshot(parentSnapshotId) : null;
     }
-    return new CommittedInfo(null, ImmutableMap.of());
+    return new SnapshotCommitMetadata(null, ImmutableMap.of(), Maps.newHashMap());
+  }
+
+  private boolean hasCommitInfo(Map<String, String> summary) {
+    return summary.get(COMMIT_ID_SNAPSHOT_PROP) != null
+        || summary.get(controlTopicOffsetsProp) != null
+        || summary.get(DATA_OFFSETS_SNAPSHOT_PROP) != null;
+  }
+
+  private SnapshotCommitMetadata parseSnapshotCommitMetadata(Map<String, String> summary) {
+    String commitIdValue = summary.get(COMMIT_ID_SNAPSHOT_PROP);
+    UUID commitId = commitIdValue != null ? UUID.fromString(commitIdValue) : null;
+    Map<Integer, Long> controlTopicOffsets = parseControlTopicOffsets(summary.get(controlTopicOffsetsProp));
+    Map<String, Map<Integer, CommitState.OffsetRange>> dataOffsets =
+        parseDataOffsets(summary.get(DATA_OFFSETS_SNAPSHOT_PROP));
+    return new SnapshotCommitMetadata(commitId, controlTopicOffsets, dataOffsets);
+  }
+
+  private Map<Integer, Long> parseControlTopicOffsets(String json) {
+    if (json == null) {
+      return ImmutableMap.of();
+    }
+    try {
+      TypeReference<Map<Integer, Long>> typeRef = new TypeReference<Map<Integer, Long>>() {};
+      return MAPPER.readValue(json, typeRef);
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+  }
+
+  private Map<String, Map<Integer, CommitState.OffsetRange>> parseDataOffsets(String json) {
+    if (json == null) {
+      return Maps.newHashMap();
+    }
+    try {
+      TypeReference<Map<String, Map<Integer, Map<String, Long>>>> typeRef =
+          new TypeReference<Map<String, Map<Integer, Map<String, Long>>>>() {};
+      Map<String, Map<Integer, Map<String, Long>>> parsed = MAPPER.readValue(json, typeRef);
+
+      Map<String, Map<Integer, CommitState.OffsetRange>> result = Maps.newHashMap();
+      for (Map.Entry<String, Map<Integer, Map<String, Long>>> topicEntry : parsed.entrySet()) {
+        Map<Integer, CommitState.OffsetRange> partitionMap = Maps.newHashMap();
+        for (Map.Entry<Integer, Map<String, Long>> partitionEntry :
+            topicEntry.getValue().entrySet()) {
+          Map<String, Long> range = partitionEntry.getValue();
+          partitionMap.put(
+              partitionEntry.getKey(),
+              new CommitState.OffsetRange(range.get("start"), range.get("end")));
+        }
+        result.put(topicEntry.getKey(), partitionMap);
+      }
+      return result;
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
   }
 
   @Override

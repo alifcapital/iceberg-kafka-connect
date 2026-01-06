@@ -20,8 +20,8 @@ package io.tabular.iceberg.connect.channel;
 
 import static java.util.stream.Collectors.groupingBy;
 
-import io.tabular.iceberg.connect.channel.UUIDv7;
 import io.tabular.iceberg.connect.IcebergSinkConfig;
+import io.tabular.iceberg.connect.events.DataOffsetsPayload;
 import java.time.OffsetDateTime;
 import java.util.Comparator;
 import java.util.LinkedList;
@@ -45,6 +45,7 @@ public class CommitState {
 
   private final List<Envelope> commitBuffer = new LinkedList<>();
   private final List<DataComplete> readyBuffer = new LinkedList<>();
+  private final List<Envelope> dataOffsetsBuffer = new LinkedList<>();
   private long startTime;
   private UUID currentCommitId;
   private final IcebergSinkConfig config;
@@ -71,6 +72,16 @@ public class CommitState {
       LOG.debug(
           "Received data complete for commit-id={} when no commit in progress, this can happen during recovery",
           ((DataComplete) envelope.event().payload()).commitId());
+    }
+  }
+
+  public void addDataOffsets(Envelope envelope) {
+    dataOffsetsBuffer.add(envelope);
+    if (!isCommitInProgress()) {
+      DataOffsetsPayload payload = (DataOffsetsPayload) envelope.localEvent().payload();
+      LOG.debug(
+          "Received data offsets for commit-id={} when no commit in progress, this can happen during recovery",
+          payload.commitId());
     }
   }
 
@@ -107,6 +118,11 @@ public class CommitState {
 
   public void clearResponses() {
     commitBuffer.clear();
+    dataOffsetsBuffer.clear();
+  }
+
+  public List<Envelope> dataOffsetsBuffer() {
+    return dataOffsetsBuffer;
   }
 
   public boolean isCommitTimedOut() {
@@ -226,6 +242,25 @@ public class CommitState {
       result = null;
     }
     return result;
+  }
+
+  /** Represents a range of offsets [start, end]. */
+  public static class OffsetRange {
+    private final long start;
+    private final long end;
+
+    public OffsetRange(long start, long end) {
+      this.start = start;
+      this.end = end;
+    }
+
+    public long start() {
+      return start;
+    }
+
+    public long end() {
+      return end;
+    }
   }
 }
 

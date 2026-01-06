@@ -30,11 +30,15 @@ class Committable {
 
   private final ImmutableMap<TopicPartition, Offset> offsetsByTopicPartition;
   private final ImmutableList<WriterResult> writerResults;
+  private final ImmutableMap<TopicPartition, Offset> dataOffsets;
 
   Committable(
-      Map<TopicPartition, Offset> offsetsByTopicPartition, List<WriterResult> writerResults) {
+      Map<TopicPartition, Offset> offsetsByTopicPartition,
+      List<WriterResult> writerResults,
+      Map<TopicPartition, Offset> dataOffsets) {
     this.offsetsByTopicPartition = ImmutableMap.copyOf(offsetsByTopicPartition);
     this.writerResults = ImmutableList.copyOf(writerResults);
+    this.dataOffsets = ImmutableMap.copyOf(dataOffsets);
   }
 
   public Map<TopicPartition, Offset> offsetsByTopicPartition() {
@@ -43,5 +47,9 @@ class Committable {
 
   public List<WriterResult> writerResults() {
     return writerResults;
+  }
+
+  public Map<TopicPartition, Offset> dataOffsets() {
+    return dataOffsets;
   }
 }

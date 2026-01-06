@@ -23,6 +23,7 @@ import io.tabular.iceberg.connect.events.CommitReadyPayload;
 import io.tabular.iceberg.connect.events.CommitRequestPayload;
 import io.tabular.iceberg.connect.events.CommitResponsePayload;
 import io.tabular.iceberg.connect.events.CommitTablePayload;
+import io.tabular.iceberg.connect.events.EventType;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
@@ -48,11 +49,16 @@ import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.Types;
 
 /**
- * Iceberg 1.5.0 introduced a breaking change to Avro serialization that the connector uses when encoding
- * messages for the control topic, requiring a way to fall back to decoding 1.4.x series messages that may
- * be left behind on a control topic when upgrading.
+ * Decodes events from the control topic. This class handles two types of events:
  *
- * This class should be removed in later revisions.
+ * <p>1. Standard Iceberg events (DataWritten, DataComplete, etc.) - decoded using AvroUtil.decode()
+ * with a fallback to legacy 1.4.x format decoding (deprecated).
+ *
+ * <p>2. DATA_OFFSETS events - local events used to track data topic partition offsets per
+ * table. These are actively used and decoded using the local Event format.
+ *
+ * <p>The legacy event decoding (for types other than DATA_OFFSETS) is deprecated and exists only
+ * to handle messages left on the control topic during upgrades from Iceberg 1.4.x to 1.5.x.
  */
 public class EventDecoder {
 
@@ -63,12 +69,42 @@ public class EventDecoder {
   }
 
   /**
-   * @deprecated
-   * <p>This provides a fallback decoder that can decode the legacy iceberg 1.4.x avro schemas in the case where
-   *   the coordinator topic was not fully drained during the upgrade to 1.5.2</p>
+   * Decodes an event from bytes and wraps it in an Envelope.
+   *
+   * @param value the raw event bytes
+   * @param partition the control topic partition
+   * @param offset the control topic offset
+   * @return Envelope containing either an Iceberg Event or a local Event, or null if decoding fails
+   */
+  public Envelope decode(byte[] value, int partition, long offset) {
+    try {
+      Event event = AvroUtil.decode(value);
+      return new Envelope(event, partition, offset);
+    } catch (SchemaParseException exception) {
+      // Try to decode as local event format (DATA_OFFSETS or legacy)
+      io.tabular.iceberg.connect.events.Event localEvent =
+          io.tabular.iceberg.connect.events.Event.decode(value);
+
+      if (localEvent.type() == EventType.DATA_OFFSETS) {
+        // DATA_OFFSETS is actively used - return as local event
+        return new Envelope(localEvent, partition, offset);
+      }
+
+      // Legacy event - convert to Iceberg Event (deprecated path)
+      Event convertedEvent = convertLegacy(localEvent);
+      if (convertedEvent == null) {
+        return null;
+      }
+      return new Envelope(convertedEvent, partition, offset);
+    }
+  }
+
+  /**
+   * @deprecated Use {@link #decode(byte[], int, long)} instead. This method is kept for backward
+   *     compatibility and test purposes.
    */
   @Deprecated
-  public Event decode(byte[] value) {
+  public Event decodeEvent(byte[] value) {
     try {
       return AvroUtil.decode(value);
     } catch (SchemaParseException exception) {

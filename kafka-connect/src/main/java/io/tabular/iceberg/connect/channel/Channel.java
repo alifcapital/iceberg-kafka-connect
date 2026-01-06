@@ -78,15 +78,16 @@ public abstract class Channel {
   }
 
   protected void send(Event event) {
-    send(ImmutableList.of(event), ImmutableMap.of(), null);
+    send(ImmutableList.of(event), ImmutableList.of(), ImmutableMap.of(), null);
   }
 
   protected void send(
       List<Event> events,
-      Map<TopicPartition, Offset> sourceOffsets,
+      List<io.tabular.iceberg.connect.events.Event> localEvents,
+      Map<TopicPartition, Offset> dataOffsets,
       ConsumerGroupMetadata consumerGroupMetadata) {
     Map<TopicPartition, OffsetAndMetadata> offsetsToCommit = Maps.newHashMap();
-    sourceOffsets.forEach((k, v) -> offsetsToCommit.put(k, new OffsetAndMetadata(v.offset())));
+    dataOffsets.forEach((k, v) -> offsetsToCommit.put(k, new OffsetAndMetadata(v.offset())));
 
     List<ProducerRecord<String, byte[]>> recordList =
         events.stream()
@@ -99,12 +100,20 @@ public abstract class Channel {
                 })
             .collect(toList());
 
+    // Add local events (e.g., DATA_OFFSETS) to the same transaction
+    localEvents.forEach(
+        event -> {
+          LOG.debug("Sending local event of type: {}", event.type().name());
+          byte[] data = io.tabular.iceberg.connect.events.Event.encode(event);
+          recordList.add(new ProducerRecord<>(controlTopic, producerId, data));
+        });
+
     synchronized (producer) {
       producer.beginTransaction();
       try {
         recordList.forEach(producer::send);
         producer.flush();
-        if (!sourceOffsets.isEmpty()) {
+        if (!dataOffsets.isEmpty()) {
           producer.sendOffsetsToTransaction(offsetsToCommit, consumerGroupMetadata);
         }
         producer.commitTransaction();
@@ -128,13 +137,16 @@ public abstract class Channel {
             // so increment the record offset by one
             controlTopicOffsets.put(record.partition(), record.offset() + 1);
 
-            Event event = eventDecoder.decode(record.value());
-            if (event != null) {
-              if (event.groupId().equals(groupId)) {
-                LOG.debug("Received event of type: {}", event.type().name());
-                if (receiveFn.apply(new Envelope(event, record.partition(), record.offset()))) {
-                  LOG.debug("Handled event of type: {}", event.type().name());
-                }
+            Envelope envelope =
+                eventDecoder.decode(record.value(), record.partition(), record.offset());
+            if (envelope != null && groupId.equals(envelope.groupId())) {
+              String eventType =
+                  envelope.isLocalEvent()
+                      ? envelope.localEventType().name()
+                      : envelope.event().type().name();
+              LOG.debug("Received event of type: {}", eventType);
+              if (receiveFn.apply(envelope)) {
+                LOG.debug("Handled event of type: {}", eventType);
               }
             }
           });

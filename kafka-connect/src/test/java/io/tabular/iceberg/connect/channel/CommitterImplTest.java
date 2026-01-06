@@ -423,13 +423,15 @@ class CommitterImplTest {
     List<DataFile> dataFiles = ImmutableList.of(createDataFile());
     List<DeleteFile> deleteFiles = ImmutableList.of();
     Types.StructType partitionStruct = Types.StructType.of();
-    Map<TopicPartition, Offset> sourceOffsets = ImmutableMap.of(SOURCE_TP0, new Offset(100L, 200L));
+    Map<TopicPartition, Offset> offsets = ImmutableMap.of(SOURCE_TP0, new Offset(100L, 200L));
+    Map<TopicPartition, Offset> dataOffsets = ImmutableMap.of(SOURCE_TP0, new Offset(100L, 200L, 0L));
     CommittableSupplier committableSupplier =
         () ->
             new Committable(
-                sourceOffsets,
+                offsets,
                 ImmutableList.of(
-                    new WriterResult(TABLE_1_IDENTIFIER, dataFiles, deleteFiles, partitionStruct)));
+                    new WriterResult(TABLE_1_IDENTIFIER, dataFiles, deleteFiles, partitionStruct)),
+                dataOffsets);
 
     try (CommitterImpl committerImpl =
         new CommitterImpl(mockContext, CONFIG, kafkaClientFactory, coordinatorThreadFactory)) {
@@ -450,7 +452,7 @@ class CommitterImplTest {
       committer.commit(committableSupplier);
 
       assertThat(producer.transactionCommitted()).isTrue();
-      assertThat(producer.history()).hasSize(2);
+      assertThat(producer.history()).hasSize(3);
       assertDataWritten(
           producer.history().get(0),
           producerId,
@@ -458,6 +460,7 @@ class CommitterImplTest {
           TABLE_1_IDENTIFIER,
           dataFiles,
           deleteFiles);
+      // DATA_COMPLETE at index 1, DATA_OFFSETS at index 2
       assertDataComplete(
           producer.history().get(1),
           producerId,
@@ -487,7 +490,7 @@ class CommitterImplTest {
             CONFIG.controlGroupId(), ImmutableMap.of(SOURCE_TP0, 110L, SOURCE_TP1, 100L)));
 
     CommittableSupplier committableSupplier =
-        () -> new Committable(ImmutableMap.of(), ImmutableList.of());
+        () -> new Committable(ImmutableMap.of(), ImmutableList.of(), ImmutableMap.of());
 
     try (CommitterImpl committerImpl =
         new CommitterImpl(mockContext, CONFIG, kafkaClientFactory, coordinatorThreadFactory)) {
@@ -546,7 +549,8 @@ class CommitterImplTest {
             new Committable(
                 ImmutableMap.of(sourceTp1, new Offset(100L, 200L)),
                 ImmutableList.of(
-                    new WriterResult(TABLE_1_IDENTIFIER, dataFiles, deleteFiles, partitionStruct)));
+                    new WriterResult(TABLE_1_IDENTIFIER, dataFiles, deleteFiles, partitionStruct)),
+                ImmutableMap.of());
 
     try (CommitterImpl committerImpl =
         new CommitterImpl(mockContext, CONFIG, kafkaClientFactory, coordinatorThreadFactory)) {
