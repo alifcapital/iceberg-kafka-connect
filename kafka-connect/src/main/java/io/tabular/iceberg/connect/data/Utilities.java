@@ -171,7 +171,7 @@ public class Utilities {
           .filter(f -> !f.type().typeId().equals(org.apache.iceberg.types.Type.TypeID.DOUBLE))
           .map(org.apache.iceberg.types.Types.NestedField::fieldId)
           .collect(toSet());
-      LOG.info("CDC mode without PK for table {}, using {} columns for equality delete",
+      LOG.info("Upsert mode without PK for table {}, using {} columns for equality delete",
           tableName, identifierFieldIds.size());
     }
 

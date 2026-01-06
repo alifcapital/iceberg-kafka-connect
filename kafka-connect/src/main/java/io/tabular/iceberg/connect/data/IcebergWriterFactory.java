@@ -124,7 +124,7 @@ public class IcebergWriterFactory {
           // No PK - create table without identifierFieldIds
           // Utilities.createTableWriter will use all columns for equality delete
           schema = new org.apache.iceberg.Schema(structType.fields());
-          LOG.info("No primary key defined for CDC table {}, will use all columns for equality delete", tableName);
+          LOG.info("No primary key defined for upsert table {}, will use all columns for equality delete", tableName);
         }
       } else {
         schema = new org.apache.iceberg.Schema(structType.fields());
