@@ -169,7 +169,10 @@ public class IcebergWriter implements RecordWriter {
     flush();
 
     WriteComplete result =
-        new WriteComplete(Lists.newArrayList(writerResults), Maps.newHashMap(dataOffsets));
+        new WriteComplete(
+            TableIdentifier.parse(tableName),
+            Lists.newArrayList(writerResults),
+            Maps.newHashMap(dataOffsets));
     writerResults.clear();
     dataOffsets.clear();
 

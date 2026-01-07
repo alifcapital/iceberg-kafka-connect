@@ -27,7 +27,7 @@ public interface RecordWriter extends Cloneable {
   default void write(SinkRecord record) {}
 
   default WriteComplete complete() {
-    return new WriteComplete(ImmutableList.of(), ImmutableMap.of());
+    return new WriteComplete(null, ImmutableList.of(), ImmutableMap.of());
   }
 
   default void close() {}

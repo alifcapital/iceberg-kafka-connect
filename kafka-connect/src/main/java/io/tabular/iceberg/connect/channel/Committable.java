@@ -22,6 +22,7 @@ import io.tabular.iceberg.connect.data.Offset;
 import io.tabular.iceberg.connect.data.WriterResult;
 import java.util.List;
 import java.util.Map;
+import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.kafka.common.TopicPartition;
@@ -30,15 +31,15 @@ class Committable {
 
   private final ImmutableMap<TopicPartition, Offset> offsetsByTopicPartition;
   private final ImmutableList<WriterResult> writerResults;
-  private final ImmutableMap<TopicPartition, Offset> dataOffsets;
+  private final ImmutableMap<TableIdentifier, Map<TopicPartition, Offset>> dataOffsetsByTable;
 
   Committable(
       Map<TopicPartition, Offset> offsetsByTopicPartition,
       List<WriterResult> writerResults,
-      Map<TopicPartition, Offset> dataOffsets) {
+      Map<TableIdentifier, Map<TopicPartition, Offset>> dataOffsetsByTable) {
     this.offsetsByTopicPartition = ImmutableMap.copyOf(offsetsByTopicPartition);
     this.writerResults = ImmutableList.copyOf(writerResults);
-    this.dataOffsets = ImmutableMap.copyOf(dataOffsets);
+    this.dataOffsetsByTable = ImmutableMap.copyOf(dataOffsetsByTable);
   }
 
   public Map<TopicPartition, Offset> offsetsByTopicPartition() {
@@ -49,7 +50,7 @@ class Committable {
     return writerResults;
   }
 
-  public Map<TopicPartition, Offset> dataOffsets() {
-    return dataOffsets;
+  public Map<TableIdentifier, Map<TopicPartition, Offset>> dataOffsetsByTable() {
+    return dataOffsetsByTable;
   }
 }

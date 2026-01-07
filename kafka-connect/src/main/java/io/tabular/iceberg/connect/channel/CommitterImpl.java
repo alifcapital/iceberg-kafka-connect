@@ -170,23 +170,27 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
               events.add(commitResponse);
             });
 
-    // Send data offsets for each table (one event per table)
-    if (!committable.dataOffsets().isEmpty()) {
-      List<io.tabular.iceberg.connect.events.TopicPartitionOffset> dataOffsetsList =
-          committable.dataOffsets().entrySet().stream()
-              .map(
-                  entry ->
-                      new io.tabular.iceberg.connect.events.TopicPartitionOffset(
-                          entry.getKey().topic(),
-                          entry.getKey().partition(),
-                          entry.getValue().offset(),
-                          entry.getValue().timestamp() != null
-                              ? entry.getValue().timestamp().toInstant().toEpochMilli()
-                              : null,
-                          entry.getValue().startOffset()))
-              .collect(toList());
+    // Send data offsets for each table (one event per table with only that table's offsets)
+    for (Map.Entry<TableIdentifier, Map<TopicPartition, Offset>> tableEntry :
+        committable.dataOffsetsByTable().entrySet()) {
+      TableIdentifier tableId = tableEntry.getKey();
+      Map<TopicPartition, Offset> tableOffsets = tableEntry.getValue();
 
-      for (TableIdentifier tableId : tables) {
+      if (!tableOffsets.isEmpty()) {
+        List<io.tabular.iceberg.connect.events.TopicPartitionOffset> dataOffsetsList =
+            tableOffsets.entrySet().stream()
+                .map(
+                    entry ->
+                        new io.tabular.iceberg.connect.events.TopicPartitionOffset(
+                            entry.getKey().topic(),
+                            entry.getKey().partition(),
+                            entry.getValue().offset(),
+                            entry.getValue().timestamp() != null
+                                ? entry.getValue().timestamp().toInstant().toEpochMilli()
+                                : null,
+                            entry.getValue().startOffset()))
+                .collect(toList());
+
         DataOffsetsPayload dataOffsetsPayload =
             new DataOffsetsPayload(commitId, TableName.of(tableId), dataOffsetsList);
 

@@ -20,6 +20,7 @@ package io.tabular.iceberg.connect.data;
 
 import java.util.List;
 import java.util.Map;
+import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.kafka.common.TopicPartition;
@@ -27,13 +28,21 @@ import org.apache.kafka.common.TopicPartition;
 /** Result of completing a write operation, containing file results and data offsets. */
 public class WriteComplete {
 
+  private final TableIdentifier tableIdentifier;
   private final ImmutableList<WriterResult> writerResults;
   private final ImmutableMap<TopicPartition, Offset> dataOffsets;
 
   public WriteComplete(
-      List<WriterResult> writerResults, Map<TopicPartition, Offset> dataOffsets) {
+      TableIdentifier tableIdentifier,
+      List<WriterResult> writerResults,
+      Map<TopicPartition, Offset> dataOffsets) {
+    this.tableIdentifier = tableIdentifier;
     this.writerResults = ImmutableList.copyOf(writerResults);
     this.dataOffsets = ImmutableMap.copyOf(dataOffsets);
+  }
+
+  public TableIdentifier tableIdentifier() {
+    return tableIdentifier;
   }
 
   public List<WriterResult> writerResults() {

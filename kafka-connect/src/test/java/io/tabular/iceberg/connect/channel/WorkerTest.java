@@ -71,7 +71,8 @@ public class WorkerTest {
             ImmutableList.of(),
             StructType.of());
     WriteComplete writeComplete =
-        new WriteComplete(ImmutableList.of(writeResult), ImmutableMap.of());
+        new WriteComplete(
+            TableIdentifier.parse(TABLE_NAME), ImmutableList.of(writeResult), ImmutableMap.of());
     IcebergWriter writer = mock(IcebergWriter.class);
     when(writer.complete()).thenReturn(writeComplete);
 

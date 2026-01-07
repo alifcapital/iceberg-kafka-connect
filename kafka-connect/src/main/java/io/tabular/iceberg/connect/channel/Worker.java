@@ -32,6 +32,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import org.apache.iceberg.catalog.Catalog;
+import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
@@ -71,15 +72,22 @@ class Worker implements Writer, AutoCloseable {
             .flatMap(wc -> wc.writerResults().stream())
             .collect(toList());
 
-    Map<TopicPartition, Offset> tableDataOffsets = Maps.newHashMap();
-    writeCompletes.forEach(wc -> tableDataOffsets.putAll(wc.dataOffsets()));
+    // Aggregate offsets per table instead of merging into flat map
+    Map<TableIdentifier, Map<TopicPartition, Offset>> dataOffsetsByTable = Maps.newHashMap();
+    for (WriteComplete wc : writeCompletes) {
+      if (wc.tableIdentifier() != null && !wc.dataOffsets().isEmpty()) {
+        dataOffsetsByTable
+            .computeIfAbsent(wc.tableIdentifier(), k -> Maps.newHashMap())
+            .putAll(wc.dataOffsets());
+      }
+    }
 
     Map<TopicPartition, Offset> offsets = Maps.newHashMap(dataOffsets);
 
     writers.clear();
     dataOffsets.clear();
 
-    return new Committable(offsets, writeResults, tableDataOffsets);
+    return new Committable(offsets, writeResults, dataOffsetsByTable);
   }
 
   @Override
