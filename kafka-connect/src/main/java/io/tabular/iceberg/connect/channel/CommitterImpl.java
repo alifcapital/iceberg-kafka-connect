@@ -22,16 +22,18 @@ import static java.util.stream.Collectors.toList;
 import static java.util.stream.Collectors.toMap;
 
 import io.tabular.iceberg.connect.IcebergSinkConfig;
+import io.tabular.iceberg.connect.channel.Channel.ControlEvent;
+import io.tabular.iceberg.connect.channel.Channel.IcebergEvent;
+import io.tabular.iceberg.connect.channel.Channel.LocalEvent;
 import io.tabular.iceberg.connect.data.Offset;
-import io.tabular.iceberg.connect.events.EventType;
 import io.tabular.iceberg.connect.events.DataOffsetsPayload;
+import io.tabular.iceberg.connect.events.EventType;
 import io.tabular.iceberg.connect.events.TableName;
 import java.io.IOException;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import org.apache.iceberg.catalog.Catalog;
@@ -47,7 +49,6 @@ import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTest
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
-import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.kafka.clients.admin.ListConsumerGroupOffsetsOptions;
 import org.apache.kafka.clients.admin.ListConsumerGroupOffsetsResult;
 import org.apache.kafka.clients.consumer.ConsumerGroupMetadata;
@@ -146,17 +147,15 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
   private void sendCommitResponse(UUID commitId, CommittableSupplier committableSupplier) {
     Committable committable = committableSupplier.committable();
 
-    List<Event> events = Lists.newArrayList();
-    List<io.tabular.iceberg.connect.events.Event> localEvents = Lists.newArrayList();
+    // Use unified event list to ensure correct ordering:
+    // DATA_WRITTEN events, then DATA_OFFSETS events, then DATA_COMPLETE
+    List<ControlEvent> allEvents = Lists.newArrayList();
 
-    // Collect unique tables from writer results
-    Set<TableIdentifier> tables = Sets.newHashSet();
+    // 1. Add all DATA_WRITTEN events
     committable
         .writerResults()
         .forEach(
             writerResult -> {
-              tables.add(writerResult.tableIdentifier());
-
               Event commitResponse =
                   new Event(
                       config.controlGroupId(),
@@ -167,10 +166,10 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
                           writerResult.dataFiles(),
                           writerResult.deleteFiles()));
 
-              events.add(commitResponse);
+              allEvents.add(new IcebergEvent(commitResponse));
             });
 
-    // Send data offsets for each table (one event per table with only that table's offsets)
+    // 2. Add DATA_OFFSETS events for each table
     for (Map.Entry<TableIdentifier, Map<TopicPartition, Offset>> tableEntry :
         committable.dataOffsetsByTable().entrySet()) {
       TableIdentifier tableId = tableEntry.getKey();
@@ -194,12 +193,14 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
         DataOffsetsPayload dataOffsetsPayload =
             new DataOffsetsPayload(commitId, TableName.of(tableId), dataOffsetsList);
 
-        localEvents.add(
-            new io.tabular.iceberg.connect.events.Event(
-                config.controlGroupId(), EventType.DATA_OFFSETS, dataOffsetsPayload));
+        allEvents.add(
+            new LocalEvent(
+                new io.tabular.iceberg.connect.events.Event(
+                    config.controlGroupId(), EventType.DATA_OFFSETS, dataOffsetsPayload)));
       }
     }
 
+    // 3. Add DATA_COMPLETE event last
     // include all assigned topic partitions even if no messages were read
     // from a partition, as the coordinator will use that to determine
     // when all data for a commit has been received
@@ -221,11 +222,11 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
         new Event(
             config.controlGroupId(),
             new DataComplete(commitId, assignments));
-    events.add(commitReady);
+    allEvents.add(new IcebergEvent(commitReady));
 
     Map<TopicPartition, Offset> offsets = committable.offsetsByTopicPartition();
-    send(events, localEvents, offsets, new ConsumerGroupMetadata(config.controlGroupId()));
-    send(ImmutableList.of(), ImmutableList.of(), offsets, new ConsumerGroupMetadata(config.connectGroupId()));
+    send(allEvents, offsets, new ConsumerGroupMetadata(config.controlGroupId()));
+    send(ImmutableList.of(), offsets, new ConsumerGroupMetadata(config.connectGroupId()));
   }
 
   @Override

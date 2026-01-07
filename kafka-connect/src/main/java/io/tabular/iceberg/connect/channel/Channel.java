@@ -49,6 +49,51 @@ public abstract class Channel {
 
   private static final Logger LOG = LoggerFactory.getLogger(Channel.class);
 
+  /** Interface for events that can be sent to the control topic. */
+  public interface ControlEvent {
+    ProducerRecord<String, byte[]> toRecord(String topic, String key);
+
+    String typeName();
+  }
+
+  /** Wrapper for Iceberg library events (DATA_WRITTEN, DATA_COMPLETE, START_COMMIT, etc.) */
+  public static class IcebergEvent implements ControlEvent {
+    private final Event event;
+
+    public IcebergEvent(Event event) {
+      this.event = event;
+    }
+
+    @Override
+    public ProducerRecord<String, byte[]> toRecord(String topic, String key) {
+      return new ProducerRecord<>(topic, key, AvroUtil.encode(event));
+    }
+
+    @Override
+    public String typeName() {
+      return event.type().name();
+    }
+  }
+
+  /** Wrapper for local events (DATA_OFFSETS) */
+  public static class LocalEvent implements ControlEvent {
+    private final io.tabular.iceberg.connect.events.Event event;
+
+    public LocalEvent(io.tabular.iceberg.connect.events.Event event) {
+      this.event = event;
+    }
+
+    @Override
+    public ProducerRecord<String, byte[]> toRecord(String topic, String key) {
+      return new ProducerRecord<>(topic, key, io.tabular.iceberg.connect.events.Event.encode(event));
+    }
+
+    @Override
+    public String typeName() {
+      return event.type().name();
+    }
+  }
+
   private final String controlTopic;
   private final String groupId;
   private final Producer<String, byte[]> producer;
@@ -78,12 +123,11 @@ public abstract class Channel {
   }
 
   protected void send(Event event) {
-    send(ImmutableList.of(event), ImmutableList.of(), ImmutableMap.of(), null);
+    send(ImmutableList.of(new IcebergEvent(event)), ImmutableMap.of(), null);
   }
 
   protected void send(
-      List<Event> events,
-      List<io.tabular.iceberg.connect.events.Event> localEvents,
+      List<ControlEvent> events,
       Map<TopicPartition, Offset> dataOffsets,
       ConsumerGroupMetadata consumerGroupMetadata) {
     Map<TopicPartition, OffsetAndMetadata> offsetsToCommit = Maps.newHashMap();
@@ -93,20 +137,10 @@ public abstract class Channel {
         events.stream()
             .map(
                 event -> {
-                  LOG.debug("Sending event of type: {}", event.type().name());
-                  byte[] data = AvroUtil.encode(event);
-                  // key by producer ID to keep event order
-                  return new ProducerRecord<>(controlTopic, producerId, data);
+                  LOG.debug("Sending event of type: {}", event.typeName());
+                  return event.toRecord(controlTopic, producerId);
                 })
             .collect(toList());
-
-    // Add local events (e.g., DATA_OFFSETS) to the same transaction
-    localEvents.forEach(
-        event -> {
-          LOG.debug("Sending local event of type: {}", event.type().name());
-          byte[] data = io.tabular.iceberg.connect.events.Event.encode(event);
-          recordList.add(new ProducerRecord<>(controlTopic, producerId, data));
-        });
 
     synchronized (producer) {
       producer.beginTransaction();

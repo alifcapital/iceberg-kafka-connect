@@ -461,9 +461,9 @@ class CommitterImplTest {
           TABLE_1_IDENTIFIER,
           dataFiles,
           deleteFiles);
-      // DATA_COMPLETE at index 1, DATA_OFFSETS at index 2
+      // Event order: DATA_WRITTEN at index 0, DATA_OFFSETS at index 1, DATA_COMPLETE at index 2
       assertDataComplete(
-          producer.history().get(1),
+          producer.history().get(2),
           producerId,
           commitId,
           ImmutableMap.of(SOURCE_TP0, Pair.of(100L, offsetDateTime(200L))));
