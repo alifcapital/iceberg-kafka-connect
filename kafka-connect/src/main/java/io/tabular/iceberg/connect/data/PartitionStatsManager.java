@@ -55,7 +55,6 @@ import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.FileAppender;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.OutputFile;
-import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.types.Comparators;
 import org.apache.iceberg.types.Types.IntegerType;
@@ -414,55 +413,6 @@ public class PartitionStatsManager {
         stats.set(11, snapshot.snapshotId());
       }
     }
-  }
-
-  /**
-   * Computes partition stats from scratch by scanning all manifests.
-   * For testing only - verifies incremental computation matches full recomputation.
-   */
-  @VisibleForTesting
-  public static PartitionStatisticsFile computeFullStats(Table table, Snapshot snapshot)
-      throws IOException {
-    if (!Partitioning.isPartitioned(table)) {
-      return null;
-    }
-
-    if (snapshot == null) {
-      return null;
-    }
-
-    StructType partitionType = Partitioning.partitionType(table);
-    PartitionMap<PartitionStats> statsMap = PartitionMap.create(table.specs());
-    FileIO io = table.io();
-    Map<Integer, PartitionSpec> specs = table.specs();
-
-    // Scan all manifests in the snapshot
-    for (ManifestFile manifest : snapshot.allManifests(io)) {
-      if (manifest.content() == ManifestContent.DATA) {
-        try (ManifestReader<DataFile> reader =
-            ManifestFiles.read(manifest, io, specs).select(Lists.newArrayList("*"))) {
-          for (DataFile file : reader) {
-            applyFileToStats(table, statsMap, partitionType, file, snapshot);
-          }
-        }
-      } else {
-        try (ManifestReader<DeleteFile> reader =
-            ManifestFiles.readDeleteManifest(manifest, io, specs)
-                .select(Lists.newArrayList("*"))) {
-          for (DeleteFile file : reader) {
-            applyFileToStats(table, statsMap, partitionType, file, snapshot);
-          }
-        }
-      }
-    }
-
-    if (statsMap.isEmpty()) {
-      return null;
-    }
-
-    List<PartitionStats> sortedStats = sortStats(statsMap.values(), partitionType);
-    Schema statsSchema = schema(partitionType);
-    return writeStatsFile(table, snapshot.snapshotId(), statsSchema, sortedStats);
   }
 
   private static List<PartitionStats> sortStats(
