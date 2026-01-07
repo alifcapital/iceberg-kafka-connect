@@ -50,10 +50,13 @@ import org.apache.iceberg.io.TaskWriter;
 import org.apache.iceberg.io.UnpartitionedWriter;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.relocated.com.google.common.primitives.Ints;
+import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.TypeUtil;
+import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.PropertyUtil;
 import org.apache.kafka.connect.data.Struct;
 import org.slf4j.Logger;
@@ -64,6 +67,7 @@ public class Utilities {
   private static final Logger LOG = LoggerFactory.getLogger(Utilities.class.getName());
   private static final List<String> HADOOP_CONF_FILES =
       ImmutableList.of("core-site.xml", "hdfs-site.xml", "hive-site.xml");
+  private static final String CDC_STRUCT_NAME = "_cdc";
 
   public static Catalog loadCatalog(IcebergSinkConfig config) {
     return CatalogUtil.buildIcebergCatalog(
@@ -165,12 +169,7 @@ public class Utilities {
     // This supports CDC without PK (like PostgreSQL REPLICA_IDENTITY_FULL)
     boolean isCdcMode = config.tablesCdcField() != null || config.upsertModeEnabled();
     if (isCdcMode && (identifierFieldIds == null || identifierFieldIds.isEmpty())) {
-      identifierFieldIds = table.schema().columns().stream()
-          .filter(f -> f.type().isPrimitiveType())
-          .filter(f -> !f.type().typeId().equals(org.apache.iceberg.types.Type.TypeID.FLOAT))
-          .filter(f -> !f.type().typeId().equals(org.apache.iceberg.types.Type.TypeID.DOUBLE))
-          .map(org.apache.iceberg.types.Types.NestedField::fieldId)
-          .collect(toSet());
+      identifierFieldIds = collectEqualityDeleteFieldIds(table.schema(), tableName);
       LOG.info("Upsert mode without PK for table {}, using {} columns for equality delete",
           tableName, identifierFieldIds.size());
     }
@@ -298,6 +297,72 @@ public class Utilities {
               closeable.getClass().getSimpleName(),
               e);
         }
+      }
+    }
+  }
+
+  /**
+   * Collects field IDs suitable for equality deletes when no identifier fields are defined.
+   * Recursively collects all primitive fields, excluding _cdc struct.
+   * Warns on FLOAT/DOUBLE columns. Fails on MAP/LIST columns.
+   */
+  static Set<Integer> collectEqualityDeleteFieldIds(
+      org.apache.iceberg.Schema schema, String tableName) {
+    Set<Integer> fieldIds = Sets.newHashSet();
+    List<String> floatDoubleWarnings = Lists.newArrayList();
+    collectPrimitiveFieldIds(schema.columns(), "", fieldIds, floatDoubleWarnings, tableName);
+
+    if (!floatDoubleWarnings.isEmpty()) {
+      LOG.warn(
+          "Table {} has FLOAT/DOUBLE columns that will be used for equality deletes: {}. "
+              + "NaN values may not match correctly in some query engines (e.g., StarRocks with single-column keys).",
+          tableName,
+          String.join(", ", floatDoubleWarnings));
+    }
+
+    return fieldIds;
+  }
+
+  private static void collectPrimitiveFieldIds(
+      List<Types.NestedField> fields,
+      String parentPath,
+      Set<Integer> fieldIds,
+      List<String> floatDoubleWarnings,
+      String tableName) {
+    for (Types.NestedField field : fields) {
+      String fieldPath = parentPath.isEmpty() ? field.name() : parentPath + "." + field.name();
+
+      // Skip _cdc struct and all its children
+      if (field.name().equals(CDC_STRUCT_NAME)) {
+        LOG.debug("Skipping {} struct and its children for equality delete fields", CDC_STRUCT_NAME);
+        continue;
+      }
+
+      Type type = field.type();
+      Type.TypeID typeId = type.typeId();
+
+      if (type.isPrimitiveType()) {
+        // Warn on FLOAT/DOUBLE but still include them
+        if (typeId == Type.TypeID.FLOAT || typeId == Type.TypeID.DOUBLE) {
+          floatDoubleWarnings.add(fieldPath);
+        }
+        fieldIds.add(field.fieldId());
+      } else if (typeId == Type.TypeID.STRUCT) {
+        // Recurse into struct
+        collectPrimitiveFieldIds(
+            type.asStructType().fields(), fieldPath, fieldIds, floatDoubleWarnings, tableName);
+      } else if (typeId == Type.TypeID.MAP) {
+        throw new IllegalArgumentException(
+            String.format(
+                "Table %s has MAP column '%s' which cannot be used for equality deletes. "
+                    + "Define explicit identifier fields in the table schema.",
+                tableName, fieldPath));
+      } else if (typeId == Type.TypeID.LIST) {
+        throw new IllegalArgumentException(
+            String.format(
+                "Table %s has LIST column '%s' which cannot be used for equality deletes. "
+                    + "Define explicit identifier fields in the table schema.",
+                tableName, fieldPath));
       }
     }
   }

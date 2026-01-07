@@ -19,6 +19,9 @@
 package io.tabular.iceberg.connect.data;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.apache.iceberg.types.Types.NestedField.optional;
+import static org.apache.iceberg.types.Types.NestedField.required;
 
 import io.tabular.iceberg.connect.IcebergSinkConfig;
 import java.io.IOException;
@@ -26,7 +29,9 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
+import java.util.Set;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.iceberg.types.Types;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.hadoop.Configurable;
 import org.apache.iceberg.inmemory.InMemoryCatalog;
@@ -156,5 +161,121 @@ public class UtilitiesTest {
 
     Object result = Utilities.extractFromRecordValue(val, "data.id.key");
     assertThat(result).isEqualTo(123L);
+  }
+
+  @Test
+  public void testCollectEqualityDeleteFieldIds_simplePrimitives() {
+    org.apache.iceberg.Schema schema =
+        new org.apache.iceberg.Schema(
+            required(1, "id", Types.LongType.get()),
+            optional(2, "name", Types.StringType.get()),
+            optional(3, "count", Types.IntegerType.get()));
+
+    Set<Integer> fieldIds = Utilities.collectEqualityDeleteFieldIds(schema, "test_table");
+
+    assertThat(fieldIds).containsExactlyInAnyOrder(1, 2, 3);
+  }
+
+  @Test
+  public void testCollectEqualityDeleteFieldIds_nestedStruct() {
+    org.apache.iceberg.Schema schema =
+        new org.apache.iceberg.Schema(
+            required(1, "id", Types.LongType.get()),
+            optional(
+                2,
+                "address",
+                Types.StructType.of(
+                    required(3, "city", Types.StringType.get()),
+                    optional(4, "zip", Types.StringType.get()))));
+
+    Set<Integer> fieldIds = Utilities.collectEqualityDeleteFieldIds(schema, "test_table");
+
+    // Should include id (1), city (3), zip (4) - all primitives
+    assertThat(fieldIds).containsExactlyInAnyOrder(1, 3, 4);
+  }
+
+  @Test
+  public void testCollectEqualityDeleteFieldIds_skipsCdcStruct() {
+    org.apache.iceberg.Schema schema =
+        new org.apache.iceberg.Schema(
+            required(1, "id", Types.LongType.get()),
+            optional(2, "data", Types.StringType.get()),
+            optional(
+                3,
+                "_cdc",
+                Types.StructType.of(
+                    required(4, "op", Types.StringType.get()),
+                    optional(5, "ts", Types.LongType.get()))));
+
+    Set<Integer> fieldIds = Utilities.collectEqualityDeleteFieldIds(schema, "test_table");
+
+    // Should only include id (1) and data (2), not _cdc struct or its children
+    assertThat(fieldIds).containsExactlyInAnyOrder(1, 2);
+  }
+
+  @Test
+  public void testCollectEqualityDeleteFieldIds_includesFloatDouble() {
+    org.apache.iceberg.Schema schema =
+        new org.apache.iceberg.Schema(
+            required(1, "id", Types.LongType.get()),
+            optional(2, "price", Types.FloatType.get()),
+            optional(3, "amount", Types.DoubleType.get()));
+
+    Set<Integer> fieldIds = Utilities.collectEqualityDeleteFieldIds(schema, "test_table");
+
+    // Float and double should be included (with warning logged)
+    assertThat(fieldIds).containsExactlyInAnyOrder(1, 2, 3);
+  }
+
+  @Test
+  public void testCollectEqualityDeleteFieldIds_failsOnMap() {
+    org.apache.iceberg.Schema schema =
+        new org.apache.iceberg.Schema(
+            required(1, "id", Types.LongType.get()),
+            optional(
+                2,
+                "tags",
+                Types.MapType.ofRequired(3, 4, Types.StringType.get(), Types.StringType.get())));
+
+    assertThatThrownBy(() -> Utilities.collectEqualityDeleteFieldIds(schema, "test_table"))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("MAP column")
+        .hasMessageContaining("tags");
+  }
+
+  @Test
+  public void testCollectEqualityDeleteFieldIds_failsOnList() {
+    org.apache.iceberg.Schema schema =
+        new org.apache.iceberg.Schema(
+            required(1, "id", Types.LongType.get()),
+            optional(2, "items", Types.ListType.ofRequired(3, Types.StringType.get())));
+
+    assertThatThrownBy(() -> Utilities.collectEqualityDeleteFieldIds(schema, "test_table"))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("LIST column")
+        .hasMessageContaining("items");
+  }
+
+  @Test
+  public void testCollectEqualityDeleteFieldIds_deeplyNested() {
+    org.apache.iceberg.Schema schema =
+        new org.apache.iceberg.Schema(
+            required(1, "id", Types.LongType.get()),
+            optional(
+                2,
+                "level1",
+                Types.StructType.of(
+                    required(3, "a", Types.StringType.get()),
+                    optional(
+                        4,
+                        "level2",
+                        Types.StructType.of(
+                            required(5, "b", Types.IntegerType.get()),
+                            optional(6, "c", Types.LongType.get()))))));
+
+    Set<Integer> fieldIds = Utilities.collectEqualityDeleteFieldIds(schema, "test_table");
+
+    // Should include all primitives: id (1), a (3), b (5), c (6)
+    assertThat(fieldIds).containsExactlyInAnyOrder(1, 3, 5, 6);
   }
 }
