@@ -46,7 +46,7 @@ public class CompactUnpartitionedDeltaWriter extends CompactDeltaTaskWriter {
       Schema schema,
       Set<Integer> identifierFieldIds,
       boolean upsertMode,
-      boolean deduplicateInserts) {
+      boolean hasRealPk) {
     super(
         spec,
         format,
@@ -57,7 +57,7 @@ public class CompactUnpartitionedDeltaWriter extends CompactDeltaTaskWriter {
         schema,
         identifierFieldIds,
         upsertMode,
-        deduplicateInserts);
+        hasRealPk);
 
     this.writer =
         new CompactEqualityDeltaWriter(
@@ -70,7 +70,7 @@ public class CompactUnpartitionedDeltaWriter extends CompactDeltaTaskWriter {
             fileFactory,
             io,
             targetFileSize,
-            deduplicateInserts);
+            hasRealPk);
   }
 
   @Override

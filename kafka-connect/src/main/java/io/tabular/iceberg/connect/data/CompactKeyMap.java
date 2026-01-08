@@ -92,6 +92,22 @@ public abstract class CompactKeyMap {
 
   /** Creates a CompactKeyMap optimized for the given equality delete schema. */
   public static CompactKeyMap create(Schema deleteSchema) {
+    return create(deleteSchema, true);
+  }
+
+  /**
+   * Creates a CompactKeyMap optimized for the given equality delete schema.
+   *
+   * @param deleteSchema schema for equality delete columns
+   * @param hasRealPk if true, uses single-value map (duplicates replace previous).
+   *                  if false, uses multi-value map (duplicates are tracked separately).
+   */
+  public static CompactKeyMap create(Schema deleteSchema, boolean hasRealPk) {
+    CompactKeyMap base = createBase(deleteSchema);
+    return hasRealPk ? base : new MultiValueWrapper(base, deleteSchema.columns().size());
+  }
+
+  private static CompactKeyMap createBase(Schema deleteSchema) {
     List<Types.NestedField> columns = deleteSchema.columns();
 
     if (columns.size() == 1) {
@@ -900,6 +916,106 @@ public abstract class CompactKeyMap {
       size = 0;
       paths.clear();
       pathToIndex.clear();
+    }
+  }
+
+  // ==================== Multi-value wrapper for tables without real PK ====================
+
+  /**
+   * Wrapper that allows multiple positions per key.
+   * Used for tables without real PK where duplicate rows are legitimate.
+   */
+  static class MultiValueWrapper extends CompactKeyMap {
+    private final CompactKeyMap delegate;
+    private final int columnCount;
+
+    // Overflow storage for duplicate keys: maps CompactKey -> list of additional positions
+    private final java.util.Map<CompactKey, List<Long>> duplicates = Maps.newHashMap();
+
+    MultiValueWrapper(CompactKeyMap delegate, int columnCount) {
+      this.delegate = delegate;
+      this.columnCount = columnCount;
+    }
+
+    @Override
+    public PathOffset put(Record key, String path, int position) {
+      int pathIndex = internPath(path);
+      PathOffset previous = delegate.put(key, path, position);
+
+      if (previous != null) {
+        // Key already exists - store previous in duplicates
+        CompactKey ck = extractKey(key);
+        duplicates.computeIfAbsent(ck, k -> Lists.newArrayList()).add(pack(previous.pathIndex, previous.position));
+      }
+
+      return null; // Never return previous - we're keeping all values
+    }
+
+    @Override
+    public PathOffset remove(Record key) {
+      CompactKey ck = extractKey(key);
+
+      // First check duplicates
+      List<Long> dups = duplicates.get(ck);
+      if (dups != null && !dups.isEmpty()) {
+        long packed = dups.remove(dups.size() - 1);
+        if (dups.isEmpty()) {
+          duplicates.remove(ck);
+        }
+        return unpack(packed);
+      }
+
+      // Then check delegate
+      return delegate.remove(key);
+    }
+
+    @Override
+    public int size() {
+      int dupCount = 0;
+      for (List<Long> list : duplicates.values()) {
+        dupCount += list.size();
+      }
+      return delegate.size() + dupCount;
+    }
+
+    @Override
+    public void clear() {
+      delegate.clear();
+      duplicates.clear();
+      paths.clear();
+      pathToIndex.clear();
+    }
+
+    @Override
+    public String getPath(int index) {
+      return delegate.getPath(index);
+    }
+
+    private CompactKey extractKey(Record key) {
+      Object[] vals = new Object[columnCount];
+      for (int i = 0; i < columnCount; i++) {
+        Object val = key.get(i, Object.class);
+        if (val == null) {
+          vals[i] = null;
+        } else if (val instanceof Integer) {
+          vals[i] = ((Integer) val).longValue();
+        } else if (val instanceof Long || val instanceof BigDecimal || val instanceof Boolean
+            || val instanceof Double || val instanceof Float) {
+          vals[i] = val;
+        } else if (val instanceof CharSequence) {
+          vals[i] = val.toString();
+        } else if (val instanceof byte[]) {
+          vals[i] = ((byte[]) val).clone();
+        } else if (val instanceof java.nio.ByteBuffer) {
+          java.nio.ByteBuffer buf = (java.nio.ByteBuffer) val;
+          byte[] bytes = new byte[buf.remaining()];
+          buf.duplicate().get(bytes);
+          vals[i] = java.nio.ByteBuffer.wrap(bytes);
+        } else {
+          vals[i] = val;
+        }
+      }
+      return new CompactKey(vals);
     }
   }
 }

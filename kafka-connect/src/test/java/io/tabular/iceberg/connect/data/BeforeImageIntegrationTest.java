@@ -209,7 +209,32 @@ public class BeforeImageIntegrationTest {
 
     WriteResult result = writer.complete();
 
-    // Find equality delete files
+    // Find position delete files
+    // With MultiValueWrapper, all duplicate rows are tracked and deleted via position deletes
+    List<DeleteFile> posDeleteFiles = Lists.newArrayList();
+    for (DeleteFile deleteFile : result.deleteFiles()) {
+      if (deleteFile.content() == FileContent.POSITION_DELETES) {
+        posDeleteFiles.add(deleteFile);
+      }
+    }
+
+    assertThat(posDeleteFiles)
+        .as("Should have position delete files for UPDATE operations")
+        .isNotEmpty();
+
+    // Read position delete contents and count records
+    long totalPosDeletes = 0;
+    for (DeleteFile posDeleteFile : posDeleteFiles) {
+      totalPosDeletes += posDeleteFile.recordCount();
+    }
+
+    // Two INSERTs of {a=1, c=0} at positions 0 and 1
+    // Two UPDATEs delete both via position deletes (MultiValueWrapper tracks all duplicates)
+    assertThat(totalPosDeletes)
+        .as("Should have exactly 2 position deletes for the two duplicate rows")
+        .isEqualTo(2);
+
+    // Verify no equality deletes (all handled via position deletes)
     List<DeleteFile> eqDeleteFiles = Lists.newArrayList();
     for (DeleteFile deleteFile : result.deleteFiles()) {
       if (deleteFile.content() == FileContent.EQUALITY_DELETES) {
@@ -218,49 +243,8 @@ public class BeforeImageIntegrationTest {
     }
 
     assertThat(eqDeleteFiles)
-        .as("Should have equality delete files for UPDATE operations")
-        .isNotEmpty();
-
-    // Read equality delete contents
-    List<Record> allEqDeletes = Lists.newArrayList();
-    for (DeleteFile eqDeleteFile : eqDeleteFiles) {
-      List<Record> deletes = readRecords(ICEBERG_SCHEMA, eqDeleteFile.location());
-      allEqDeletes.addAll(deletes);
-    }
-
-    // Verify: equality deletes should contain BEFORE values {a=1, c=0}
-    // NOT AFTER values {a=1, c=1}
-    Record expectedBeforeRecord = GenericRecord.create(ICEBERG_SCHEMA);
-    expectedBeforeRecord.setField("a", 1);
-    expectedBeforeRecord.setField("c", 0);
-
-    Record wrongAfterRecord = GenericRecord.create(ICEBERG_SCHEMA);
-    wrongAfterRecord.setField("a", 1);
-    wrongAfterRecord.setField("c", 1);
-
-    assertThat(allEqDeletes)
-        .as("Equality deletes should contain BEFORE image {a=1, c=0}")
-        .contains(expectedBeforeRecord);
-
-    // Count how many times {a=1, c=0} appears
-    // First UPDATE finds row in insertedRowMap (from snapshot reads) -> positional delete
-    // Second UPDATE doesn't find row (already removed) -> equality delete with BEFORE image
-    long beforeCount = allEqDeletes.stream()
-        .filter(r -> r.getField("a").equals(1) && r.getField("c").equals(0))
-        .count();
-
-    assertThat(beforeCount)
-        .as("Should have 1 equality delete with BEFORE values {a=1, c=0}")
-        .isEqualTo(1);
-
-    // Verify we don't have the wrong AFTER values in equality deletes
-    long afterCount = allEqDeletes.stream()
-        .filter(r -> r.getField("a").equals(1) && r.getField("c").equals(1))
-        .count();
-
-    assertThat(afterCount)
-        .as("Should NOT have equality deletes with AFTER values {a=1, c=1}")
-        .isEqualTo(0);
+        .as("Should have no equality deletes when all rows tracked in buffer")
+        .isEmpty();
   }
 
   private List<SinkRecord> createDebeziumEvents() {

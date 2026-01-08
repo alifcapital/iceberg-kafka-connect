@@ -54,7 +54,7 @@ public class CompactPartitionedDeltaWriter extends CompactDeltaTaskWriter {
       Schema schema,
       Set<Integer> identifierFieldIds,
       boolean upsertMode,
-      boolean deduplicateInserts) {
+      boolean hasRealPk) {
     super(
         spec,
         format,
@@ -65,7 +65,7 @@ public class CompactPartitionedDeltaWriter extends CompactDeltaTaskWriter {
         schema,
         identifierFieldIds,
         upsertMode,
-        deduplicateInserts);
+        hasRealPk);
 
     this.partitionKey = new PartitionKey(spec, schema);
     this.wrapper = new InternalRecordWrapper(schema.asStruct());

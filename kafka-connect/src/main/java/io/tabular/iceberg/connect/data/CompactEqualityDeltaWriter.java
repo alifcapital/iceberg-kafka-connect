@@ -72,7 +72,7 @@ public class CompactEqualityDeltaWriter implements Closeable {
   // Compact key-to-position map instead of StructLikeMap
   private final CompactKeyMap insertedRowMap;
 
-  // If false, skip in-buffer deduplication in write() to avoid data loss for tables without real PK
+  // If true, deduplicate inserts in buffer. If false, track all positions for tables without real PK.
   private final boolean deduplicateInserts;
 
   // Writers
@@ -110,7 +110,8 @@ public class CompactEqualityDeltaWriter implements Closeable {
     this.keyProjection = RecordProjection.create(schema, deleteSchema);
 
     // Create compact key map based on delete schema
-    this.insertedRowMap = CompactKeyMap.create(deleteSchema);
+    // For tables without real PK, use multi-value map to track duplicate positions
+    this.insertedRowMap = CompactKeyMap.create(deleteSchema, deduplicateInserts);
 
     // Initialize writers
     this.dataWriter = new RollingDataWriterWrapper();
@@ -140,12 +141,12 @@ public class CompactEqualityDeltaWriter implements Closeable {
     Record keyRecord = keyProjection.wrap(row);
 
     // Track position for deleteKey() lookups
+    // For deduplicateInserts=true: put() replaces previous and returns it for position delete
+    // For deduplicateInserts=false: put() tracks all positions, returns null (handled by MultiValueWrapper)
     CompactKeyMap.PathOffset previous = insertedRowMap.put(keyRecord, currentPath, currentRows);
 
-    // Only deduplicate inserts when we have a real PK.
-    // For tables without PK (fake identifierFieldIds = all columns), duplicate rows are legitimate
-    // and should not be collapsed.
     if (deduplicateInserts && previous != null) {
+      // Deduplicate: delete previous row with same key
       writePosDelete(insertedRowMap.getPath(previous.pathIndex), previous.position);
     }
 
