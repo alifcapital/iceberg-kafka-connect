@@ -26,14 +26,24 @@ public class RecordWrapper implements Record {
 
   private final Record delegate;
   private final Operation op;
+  private final Record before;
 
   public RecordWrapper(Record delegate, Operation op) {
+    this(delegate, op, null);
+  }
+
+  public RecordWrapper(Record delegate, Operation op, Record before) {
     this.delegate = delegate;
     this.op = op;
+    this.before = before;
   }
 
   public Operation op() {
     return op;
+  }
+
+  public Record before() {
+    return before;
   }
 
   @Override
@@ -58,12 +68,12 @@ public class RecordWrapper implements Record {
 
   @Override
   public Record copy() {
-    return new RecordWrapper(delegate.copy(), op);
+    return new RecordWrapper(delegate.copy(), op, before != null ? before.copy() : null);
   }
 
   @Override
   public Record copy(Map<String, Object> overwriteValues) {
-    return new RecordWrapper(delegate.copy(overwriteValues), op);
+    return new RecordWrapper(delegate.copy(overwriteValues), op, before != null ? before.copy() : null);
   }
 
   @Override

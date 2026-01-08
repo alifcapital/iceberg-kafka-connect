@@ -90,7 +90,7 @@ public class CompactPartitionedDeltaWriter extends CompactDeltaTaskWriter {
               fileFactory(),
               io(),
               targetFileSize(),
-              deduplicateInserts());
+              hasRealPk());
       writers.put(copiedKey, writer);
     }
 

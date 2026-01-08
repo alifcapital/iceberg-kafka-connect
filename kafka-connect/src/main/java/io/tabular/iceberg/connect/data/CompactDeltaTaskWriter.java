@@ -48,7 +48,7 @@ public abstract class CompactDeltaTaskWriter implements TaskWriter<Record> {
   private final FileIO io;
   private final long targetFileSize;
   private final boolean upsertMode;
-  private final boolean deduplicateInserts;
+  private final boolean hasRealPk;
   private final RecordProjection keyProjection;
 
   private WriteResult result = null;
@@ -63,7 +63,7 @@ public abstract class CompactDeltaTaskWriter implements TaskWriter<Record> {
       Schema schema,
       Set<Integer> identifierFieldIds,
       boolean upsertMode,
-      boolean deduplicateInserts) {
+      boolean hasRealPk) {
     this.spec = spec;
     this.format = format;
     this.appenderFactory = appenderFactory;
@@ -73,7 +73,7 @@ public abstract class CompactDeltaTaskWriter implements TaskWriter<Record> {
     this.schema = schema;
     this.identifierFieldIds = identifierFieldIds;
     this.upsertMode = upsertMode;
-    this.deduplicateInserts = deduplicateInserts;
+    this.hasRealPk = hasRealPk;
 
     Schema deleteSchema =
         org.apache.iceberg.types.TypeUtil.select(
@@ -113,8 +113,8 @@ public abstract class CompactDeltaTaskWriter implements TaskWriter<Record> {
     return targetFileSize;
   }
 
-  protected boolean deduplicateInserts() {
-    return deduplicateInserts;
+  protected boolean hasRealPk() {
+    return hasRealPk;
   }
 
   /**
@@ -130,8 +130,12 @@ public abstract class CompactDeltaTaskWriter implements TaskWriter<Record> {
   @Override
   public void write(Record row) throws IOException {
     Operation op;
+    Record before = null;
+
     if (row instanceof RecordWrapper) {
-      op = ((RecordWrapper) row).op();
+      RecordWrapper wrapper = (RecordWrapper) row;
+      op = wrapper.op();
+      before = wrapper.before();
       if (upsertMode && op == Operation.INSERT) {
         op = Operation.UPDATE;
       }
@@ -141,12 +145,31 @@ public abstract class CompactDeltaTaskWriter implements TaskWriter<Record> {
 
     CompactEqualityDeltaWriter writer = route(row);
 
-    if (op == Operation.UPDATE || op == Operation.DELETE) {
-      writer.deleteKey(keyProjection.wrap(row));
-    }
+    switch (op) {
+      case DELETE:
+        // For DELETE, DebeziumTransform puts before image into row
+        writer.deleteKey(keyProjection.wrap(row));
+        break;
 
-    if (op == Operation.UPDATE || op == Operation.INSERT) {
-      writer.write(row);
+      case UPDATE:
+        // For UPDATE without real PK, we must use before image for equality delete
+        // because all columns are used as identifier fields
+        if (!hasRealPk) {
+          if (before == null) {
+            throw new IllegalStateException(
+                "UPDATE operation requires before image for tables without real PK");
+          }
+          writer.deleteKey(keyProjection.wrap(before));
+        } else {
+          // For tables with real PK, keyProjection extracts only PK fields which are same in before/after
+          writer.deleteKey(keyProjection.wrap(row));
+        }
+        writer.write(row);
+        break;
+
+      case INSERT:
+        writer.write(row);
+        break;
     }
   }
 

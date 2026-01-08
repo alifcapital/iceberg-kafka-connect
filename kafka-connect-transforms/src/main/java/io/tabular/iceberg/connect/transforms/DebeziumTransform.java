@@ -83,12 +83,23 @@ public class DebeziumTransform<R extends ConnectRecord<R>> implements Transforma
 
     Struct payload;
     Schema payloadSchema;
+    Struct beforeImage = null;
+    Schema beforeImageSchema = null;
+
     if (op.equals(CdcConstants.OP_DELETE)) {
       payload = value.getStruct("before");
       payloadSchema = value.schema().field("before").schema();
     } else {
       payload = value.getStruct("after");
       payloadSchema = value.schema().field("after").schema();
+
+      // For UPDATE, capture before image for equality delete
+      if (op.equals(CdcConstants.OP_UPDATE)) {
+        beforeImage = value.getStruct("before");
+        if (beforeImage != null) {
+          beforeImageSchema = value.schema().field("before").schema();
+        }
+      }
     }
 
     // create the CDC metadata
@@ -108,7 +119,7 @@ public class DebeziumTransform<R extends ConnectRecord<R>> implements Transforma
     }
 
     // create the new value
-    Schema newValueSchema = makeUpdatedSchema(payloadSchema, cdcSchema);
+    Schema newValueSchema = makeUpdatedSchema(payloadSchema, cdcSchema, beforeImageSchema);
     Struct newValue = new Struct(newValueSchema);
 
     for (Field field : payloadSchema.fields()) {
@@ -117,6 +128,17 @@ public class DebeziumTransform<R extends ConnectRecord<R>> implements Transforma
     newValue.put("_cdc_op", cdcMetadata.get(CdcConstants.COL_OP));
     newValue.put("_cdc_tsms", cdcMetadata.get(CdcConstants.COL_TS));
     newValue.put(CdcConstants.COL_CDC, cdcMetadata);
+
+    // Add before image for UPDATE operations (enriched with _cdc_op and _cdc_tsms)
+    if (beforeImage != null) {
+      Struct enrichedBefore = new Struct(newValueSchema.field(CdcConstants.COL_BEFORE_IMAGE).schema());
+      for (Field field : beforeImageSchema.fields()) {
+        enrichedBefore.put(field.name(), beforeImage.get(field));
+      }
+      enrichedBefore.put("_cdc_op", cdcMetadata.get(CdcConstants.COL_OP));
+      enrichedBefore.put("_cdc_tsms", cdcMetadata.get(CdcConstants.COL_TS));
+      newValue.put(CdcConstants.COL_BEFORE_IMAGE, enrichedBefore);
+    }
 
     return record.newRecord(
         record.topic(),
@@ -139,10 +161,15 @@ public class DebeziumTransform<R extends ConnectRecord<R>> implements Transforma
     op = mapOperation(op);
 
     Object payload;
+    Object beforeImage = null;
     if (op.equals(CdcConstants.OP_DELETE)) {
       payload = value.get("before");
     } else {
       payload = value.get("after");
+      // For UPDATE, capture before image for equality delete
+      if (op.equals(CdcConstants.OP_UPDATE)) {
+        beforeImage = value.get("before");
+      }
     }
 
     if (!(payload instanceof Map)) {
@@ -166,6 +193,15 @@ public class DebeziumTransform<R extends ConnectRecord<R>> implements Transforma
     // create the new value
     Map<String, Object> newValue = Maps.newHashMap((Map<String, Object>) payload);
     newValue.put(CdcConstants.COL_CDC, cdcMetadata);
+
+    // Add before image for UPDATE operations (enriched with _cdc_op and _cdc_tsms)
+    if (beforeImage instanceof Map) {
+      @SuppressWarnings("unchecked")
+      Map<String, Object> enrichedBefore = Maps.newHashMap((Map<String, Object>) beforeImage);
+      enrichedBefore.put("_cdc_op", cdcMetadata.get(CdcConstants.COL_OP));
+      enrichedBefore.put("_cdc_tsms", cdcMetadata.get(CdcConstants.COL_TS));
+      newValue.put(CdcConstants.COL_BEFORE_IMAGE, enrichedBefore);
+    }
 
     return record.newRecord(
         record.topic(),
@@ -253,7 +289,7 @@ public class DebeziumTransform<R extends ConnectRecord<R>> implements Transforma
     return builder.build();
   }
 
-  private Schema makeUpdatedSchema(Schema schema, Schema cdcSchema) {
+  private Schema makeUpdatedSchema(Schema schema, Schema cdcSchema, Schema beforeImageSchema) {
     SchemaBuilder builder = SchemaUtil.copySchemaBasics(schema, SchemaBuilder.struct());
 
     for (Field field : schema.fields()) {
@@ -263,6 +299,17 @@ public class DebeziumTransform<R extends ConnectRecord<R>> implements Transforma
     builder.field("_cdc_op", Schema.STRING_SCHEMA);
     builder.field("_cdc_tsms", Timestamp.SCHEMA);
     builder.field(CdcConstants.COL_CDC, cdcSchema);
+
+    // Add optional before image schema for UPDATE operations (enriched with _cdc_op and _cdc_tsms)
+    if (beforeImageSchema != null) {
+      SchemaBuilder beforeBuilder = SchemaUtil.copySchemaBasics(beforeImageSchema, SchemaBuilder.struct());
+      for (Field field : beforeImageSchema.fields()) {
+        beforeBuilder.field(field.name(), field.schema());
+      }
+      beforeBuilder.field("_cdc_op", Schema.STRING_SCHEMA);
+      beforeBuilder.field("_cdc_tsms", Timestamp.SCHEMA);
+      builder.field(CdcConstants.COL_BEFORE_IMAGE, beforeBuilder.build());
+    }
 
     return builder.build();
   }

@@ -33,6 +33,7 @@ import org.apache.iceberg.io.WriteResult;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.errors.DataException;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.slf4j.Logger;
@@ -76,7 +77,8 @@ public class IcebergWriter implements RecordWriter {
           writer.write(row);
         } else {
           Operation op = extractCdcOperation(record.value(), cdcField);
-          writer.write(new RecordWrapper(row, op));
+          Record before = extractBeforeImage(record.value());
+          writer.write(new RecordWrapper(row, op, before));
         }
         trackDataOffset(record);
       }
@@ -146,6 +148,28 @@ public class IcebergWriter implements RecordWriter {
       default:
         return Operation.INSERT;
     }
+  }
+
+  private Record extractBeforeImage(Object recordValue) {
+    // Check if field exists before extracting (only present for UPDATE operations)
+    if (recordValue instanceof Struct) {
+      Struct struct = (Struct) recordValue;
+      if (struct.schema().field("_before_image") == null) {
+        return null;
+      }
+    } else if (recordValue instanceof Map) {
+      @SuppressWarnings("unchecked")
+      Map<String, Object> map = (Map<String, Object>) recordValue;
+      if (!map.containsKey("_before_image")) {
+        return null;
+      }
+    }
+
+    Object beforeImage = Utilities.extractFromRecordValue(recordValue, "_before_image");
+    if (beforeImage == null) {
+      return null;
+    }
+    return recordConverter.convert(beforeImage);
   }
 
   private void flush() {

@@ -48,6 +48,7 @@ public class DebeziumTransformTest {
           .field("db", Schema.STRING_SCHEMA)
           .field("schema", Schema.STRING_SCHEMA)
           .field("table", Schema.STRING_SCHEMA)
+          .field("ts_ms", Schema.INT64_SCHEMA)
           .build();
 
   private static final Schema VALUE_SCHEMA =
@@ -99,7 +100,7 @@ public class DebeziumTransformTest {
 
       Struct event = createDebeziumEventStruct("u");
       Struct key = new Struct(KEY_SCHEMA).put("account_id", 1L);
-      SinkRecord record = new SinkRecord("topic", 0, KEY_SCHEMA, key, VALUE_SCHEMA, event, 0);
+      SinkRecord record = new SinkRecord("server.schema.tbl", 0, KEY_SCHEMA, key, VALUE_SCHEMA, event, 0);
 
       SinkRecord result = smt.apply(record);
       assertThat(result.value()).isInstanceOf(Struct.class);
@@ -138,7 +139,7 @@ public class DebeziumTransformTest {
 
   private Struct createDebeziumEventStruct(String operation) {
     Struct source =
-        new Struct(SOURCE_SCHEMA).put("db", "db").put("schema", "schema").put("table", "tbl");
+        new Struct(SOURCE_SCHEMA).put("db", "db").put("schema", "schema").put("table", "tbl").put("ts_ms", System.currentTimeMillis());
 
     Struct data =
         new Struct(ROW_SCHEMA)

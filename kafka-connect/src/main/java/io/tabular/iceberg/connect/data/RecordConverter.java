@@ -197,6 +197,12 @@ public class RecordConverter {
     map.forEach(
         (recordFieldNameObj, recordFieldValue) -> {
           String recordFieldName = recordFieldNameObj.toString();
+
+          // Skip _before_image - it's only used for delete logic, not stored in Iceberg
+          if ("_before_image".equals(recordFieldName)) {
+            return;
+          }
+
           NestedField tableField = lookupStructField(recordFieldName, schema, structFieldId);
           if (tableField == null) {
             // add the column if schema evolution is on, otherwise skip the value,
@@ -250,6 +256,11 @@ public class RecordConverter {
     GenericRecord result = GenericRecord.create(schema);
 
     for (Field recordField : struct.schema().fields()) {
+      // Skip _before_image - it's only used for delete logic, not stored in Iceberg
+      if ("_before_image".equals(recordField.name())) {
+        continue;
+      }
+
       NestedField tableField = lookupStructField(recordField.name(), schema, structFieldId);
       if (tableField == null) {
         // add the column if schema evolution is on, otherwise skip the value
