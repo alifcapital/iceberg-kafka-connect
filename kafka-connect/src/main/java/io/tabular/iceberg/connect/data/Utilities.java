@@ -335,9 +335,9 @@ public class Utilities {
     for (Types.NestedField field : fields) {
       String fieldPath = parentPath.isEmpty() ? field.name() : parentPath + "." + field.name();
 
-      // Skip _cdc struct and all its children
-      if (field.name().equals(CDC_STRUCT_NAME)) {
-        LOG.debug("Skipping {} struct and its children for equality delete fields", CDC_STRUCT_NAME);
+      // Skip _cdc struct and _cdc_* columns (CDC metadata should not be used for equality delete)
+      if (field.name().equals(CDC_STRUCT_NAME) || field.name().startsWith("_cdc_")) {
+        LOG.debug("Skipping CDC field {} for equality delete fields", field.name());
         continue;
       }
 
