@@ -33,4 +33,11 @@ public interface CdcConstants {
   String COL_TARGET = "target";
   String COL_KEY = "key";
   String COL_BEFORE_IMAGE = "_before_image";
+
+  // CDC source coordinates for deduplication (inside _cdc struct)
+  String COL_GTID = "gtid";
+  String COL_BINLOG_FILE = "binlog_file";
+  String COL_BINLOG_POS = "binlog_pos";
+  String COL_PG_TXID = "pgtxid";
+  String COL_LSN = "lsn";
 }

@@ -228,6 +228,47 @@ public class DebeziumTransform<R extends ConnectRecord<R>> implements Transforma
     String table = source.getString("table");
 
     cdcMetadata.put(CdcConstants.COL_SOURCE, db + "." + table);
+
+    // Extract CDC source coordinates for deduplication
+    extractSourceCoordinates(source, cdcMetadata);
+  }
+
+  private void extractSourceCoordinates(Struct source, Struct cdcMetadata) {
+    Schema sourceSchema = source.schema();
+
+    // MySQL GTID (optional, only when GTID mode enabled)
+    if (sourceSchema.field("gtid") != null) {
+      Object gtid = source.get("gtid");
+      if (gtid != null) {
+        cdcMetadata.put(CdcConstants.COL_GTID, gtid.toString());
+      }
+    }
+
+    // MySQL binlog file
+    if (sourceSchema.field("file") != null) {
+      cdcMetadata.put(CdcConstants.COL_BINLOG_FILE, source.getString("file"));
+    }
+
+    // MySQL binlog position
+    if (sourceSchema.field("pos") != null) {
+      cdcMetadata.put(CdcConstants.COL_BINLOG_POS, source.getInt64("pos"));
+    }
+
+    // PostgreSQL transaction ID
+    if (sourceSchema.field("txId") != null) {
+      Object txId = source.get("txId");
+      if (txId != null) {
+        cdcMetadata.put(CdcConstants.COL_PG_TXID, ((Number) txId).longValue());
+      }
+    }
+
+    // PostgreSQL LSN
+    if (sourceSchema.field("lsn") != null) {
+      Object lsn = source.get("lsn");
+      if (lsn != null) {
+        cdcMetadata.put(CdcConstants.COL_LSN, ((Number) lsn).longValue());
+      }
+    }
   }
 
   private void setTableTargetFromTopic(String topic, Struct cdcMetadata) {
@@ -254,6 +295,41 @@ public class DebeziumTransform<R extends ConnectRecord<R>> implements Transforma
 
     cdcMetadata.put(CdcConstants.COL_SOURCE, db + "." + table);
     cdcMetadata.put(CdcConstants.COL_TARGET, target(db, table));
+
+    // Extract CDC source coordinates for deduplication
+    extractSourceCoordinatesFromMap(map, cdcMetadata);
+  }
+
+  private void extractSourceCoordinatesFromMap(Map<String, Object> source, Map<String, Object> cdcMetadata) {
+    // MySQL GTID (optional, only when GTID mode enabled)
+    Object gtid = source.get("gtid");
+    if (gtid != null) {
+      cdcMetadata.put(CdcConstants.COL_GTID, gtid.toString());
+    }
+
+    // MySQL binlog file
+    Object file = source.get("file");
+    if (file != null) {
+      cdcMetadata.put(CdcConstants.COL_BINLOG_FILE, file.toString());
+    }
+
+    // MySQL binlog position
+    Object pos = source.get("pos");
+    if (pos != null) {
+      cdcMetadata.put(CdcConstants.COL_BINLOG_POS, ((Number) pos).longValue());
+    }
+
+    // PostgreSQL transaction ID
+    Object txId = source.get("txId");
+    if (txId != null) {
+      cdcMetadata.put(CdcConstants.COL_PG_TXID, ((Number) txId).longValue());
+    }
+
+    // PostgreSQL LSN
+    Object lsn = source.get("lsn");
+    if (lsn != null) {
+      cdcMetadata.put(CdcConstants.COL_LSN, ((Number) lsn).longValue());
+    }
   }
 
   private String target(String db, String table) {
@@ -270,7 +346,13 @@ public class DebeziumTransform<R extends ConnectRecord<R>> implements Transforma
             .field(CdcConstants.COL_PARTITION, Schema.INT32_SCHEMA)
             .field(CdcConstants.COL_OFFSET, Schema.OPTIONAL_INT64_SCHEMA)
             .field(CdcConstants.COL_SOURCE, Schema.STRING_SCHEMA)
-            .field(CdcConstants.COL_TARGET, Schema.STRING_SCHEMA);
+            .field(CdcConstants.COL_TARGET, Schema.STRING_SCHEMA)
+            // CDC source coordinates for deduplication
+            .field(CdcConstants.COL_GTID, Schema.OPTIONAL_STRING_SCHEMA)
+            .field(CdcConstants.COL_BINLOG_FILE, Schema.OPTIONAL_STRING_SCHEMA)
+            .field(CdcConstants.COL_BINLOG_POS, Schema.OPTIONAL_INT64_SCHEMA)
+            .field(CdcConstants.COL_PG_TXID, Schema.OPTIONAL_INT64_SCHEMA)
+            .field(CdcConstants.COL_LSN, Schema.OPTIONAL_INT64_SCHEMA);
 
     if (keySchema != null) {
       builder.field(CdcConstants.COL_KEY, keySchema);
