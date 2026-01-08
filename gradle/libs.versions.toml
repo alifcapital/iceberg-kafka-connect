@@ -62,7 +62,7 @@ palantir-gradle = "com.palantir.baseline:gradle-baseline-java:4.42.0"
 
 [bundles]
 iceberg = ["iceberg-api", "iceberg-common", "iceberg-core", "iceberg-data", "iceberg-guava", "iceberg-orc", "iceberg-parquet", "iceberg-kafka-connect-events"]
-iceberg-ext = ["iceberg-aws", "iceberg-aws-bundle", "iceberg-azure", "iceberg-azure-bundle", "iceberg-gcp","iceberg-gcp-bundle", "iceberg-nessie"]
+iceberg-ext = ["iceberg-aws", "iceberg-aws-bundle", "iceberg-nessie"]
 jackson = ["jackson-core", "jackson-databind"]
 kafka-connect = ["kafka-clients", "kafka-connect-api", "kafka-connect-json", "kafka-connect-transforms"]
 
