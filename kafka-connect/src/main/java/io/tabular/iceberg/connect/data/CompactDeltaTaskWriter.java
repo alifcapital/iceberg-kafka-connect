@@ -48,6 +48,7 @@ public abstract class CompactDeltaTaskWriter implements TaskWriter<Record> {
   private final FileIO io;
   private final long targetFileSize;
   private final boolean upsertMode;
+  private final boolean deduplicateInserts;
   private final RecordProjection keyProjection;
 
   private WriteResult result = null;
@@ -61,7 +62,8 @@ public abstract class CompactDeltaTaskWriter implements TaskWriter<Record> {
       long targetFileSize,
       Schema schema,
       Set<Integer> identifierFieldIds,
-      boolean upsertMode) {
+      boolean upsertMode,
+      boolean deduplicateInserts) {
     this.spec = spec;
     this.format = format;
     this.appenderFactory = appenderFactory;
@@ -71,6 +73,7 @@ public abstract class CompactDeltaTaskWriter implements TaskWriter<Record> {
     this.schema = schema;
     this.identifierFieldIds = identifierFieldIds;
     this.upsertMode = upsertMode;
+    this.deduplicateInserts = deduplicateInserts;
 
     Schema deleteSchema =
         org.apache.iceberg.types.TypeUtil.select(
@@ -108,6 +111,10 @@ public abstract class CompactDeltaTaskWriter implements TaskWriter<Record> {
 
   protected long targetFileSize() {
     return targetFileSize;
+  }
+
+  protected boolean deduplicateInserts() {
+    return deduplicateInserts;
   }
 
   /**

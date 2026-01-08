@@ -53,7 +53,8 @@ public class CompactPartitionedDeltaWriter extends CompactDeltaTaskWriter {
       long targetFileSize,
       Schema schema,
       Set<Integer> identifierFieldIds,
-      boolean upsertMode) {
+      boolean upsertMode,
+      boolean deduplicateInserts) {
     super(
         spec,
         format,
@@ -63,7 +64,8 @@ public class CompactPartitionedDeltaWriter extends CompactDeltaTaskWriter {
         targetFileSize,
         schema,
         identifierFieldIds,
-        upsertMode);
+        upsertMode,
+        deduplicateInserts);
 
     this.partitionKey = new PartitionKey(spec, schema);
     this.wrapper = new InternalRecordWrapper(schema.asStruct());
@@ -87,7 +89,8 @@ public class CompactPartitionedDeltaWriter extends CompactDeltaTaskWriter {
               appenderFactory(),
               fileFactory(),
               io(),
-              targetFileSize());
+              targetFileSize(),
+              deduplicateInserts());
       writers.put(copiedKey, writer);
     }
 

@@ -127,7 +127,8 @@ public class CompactEqualityDeltaWriterTest {
         appenderFactory,
         fileFactory,
         fileIO,
-        targetFileSize);
+        targetFileSize,
+        true); // deduplicateInserts = true (has real PK)
   }
 
   /**
@@ -429,7 +430,8 @@ public class CompactEqualityDeltaWriterTest {
             stringAppenderFactory,
             fileFactory,
             fileIO,
-            Long.MAX_VALUE);
+            Long.MAX_VALUE,
+            true); // deduplicateInserts = true (has real PK)
 
     GenericRecord rec1 = GenericRecord.create(stringKeySchema);
     rec1.setField("id", "key-1");
@@ -482,7 +484,8 @@ public class CompactEqualityDeltaWriterTest {
             uuidAppenderFactory,
             fileFactory,
             fileIO,
-            Long.MAX_VALUE);
+            Long.MAX_VALUE,
+            true); // deduplicateInserts = true (has real PK)
 
     String uuid1 = "550e8400-e29b-41d4-a716-446655440000";
     String uuid2 = "550e8400-e29b-41d4-a716-446655440001";
@@ -567,7 +570,8 @@ public class CompactEqualityDeltaWriterTest {
             appenderFactoryWithProps,
             fileFactoryWithProps,
             fileIO,
-            100L); // Small target to force early rolling
+            100L, // Small target to force early rolling
+            true); // deduplicateInserts = true (has real PK)
 
     // Write 2100 records to force rolling (ROWS_DIVISOR=1000)
     // With small row groups, first file should have multiple row groups
