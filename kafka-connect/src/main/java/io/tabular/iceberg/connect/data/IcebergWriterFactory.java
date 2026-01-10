@@ -23,6 +23,7 @@ import io.tabular.iceberg.connect.IcebergSinkConfig;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 import org.apache.iceberg.PartitionSpec;
@@ -87,20 +88,48 @@ public class IcebergWriterFactory {
 
       if (config.tablesCdcField() != null || config.upsertModeEnabled()) {
         Set<Integer> equalityFieldIds = Set.of();
-        // Get PK from Kafka topic key
-        if (sample.keySchema() != null) {
-          equalityFieldIds =
-              sample.keySchema().fields().stream()
-                .map(col -> structType.field(col.name()).fieldId())
-                .collect(toSet());
-        }
-        // Override PK with table config
-        List<String> idCols = config.tableConfig(tableName).idColumns();
-        if (!idCols.isEmpty()) {
-          equalityFieldIds =
-            idCols.stream()
-                .map(colName -> structType.field(colName).fieldId())
-                .collect(toSet());
+        Optional<Boolean> hasRealPkConfig = config.tableConfig(tableName).hasRealPk();
+
+        // If explicitly configured as no-PK, skip identifier fields
+        if (hasRealPkConfig.isPresent() && !hasRealPkConfig.get()) {
+          LOG.info("Table {} configured with has-real-pk=false, will use all columns for equality delete", tableName);
+        } else {
+          // Get PK from Kafka topic key
+          if (sample.keySchema() != null) {
+            boolean allKeysRequired = sample.keySchema().fields().stream()
+                .noneMatch(field -> field.schema().isOptional());
+            if (allKeysRequired) {
+              equalityFieldIds =
+                  sample.keySchema().fields().stream()
+                    .map(col -> structType.field(col.name()).fieldId())
+                    .collect(toSet());
+            } else {
+              // Keys are nullable - fail unless explicitly configured
+              throw new DataException(String.format(
+                  "Table %s has nullable key fields which cannot be used as identifier fields. "
+                  + "Iceberg requires identifier fields to be NOT NULL. "
+                  + "To use all columns for equality delete (before/after image mode), "
+                  + "set iceberg.table.%s.has-real-pk=false",
+                  tableName, tableName));
+            }
+          }
+          // Override PK with table config
+          List<String> idCols = config.tableConfig(tableName).idColumns();
+          if (!idCols.isEmpty()) {
+            equalityFieldIds =
+              idCols.stream()
+                  .map(colName -> structType.field(colName).fieldId())
+                  .collect(toSet());
+          }
+
+          // If no identifier fields found, fail and require explicit config
+          if (equalityFieldIds.isEmpty()) {
+            throw new DataException(String.format(
+                "Table %s has no key fields to use as identifier fields. "
+                + "To use all columns for equality delete (before/after image mode), "
+                + "set iceberg.table.%s.has-real-pk=false",
+                tableName, tableName));
+          }
         }
 
         // If we have explicit PK, create schema with identifierFieldIds (requires NOT NULL columns)

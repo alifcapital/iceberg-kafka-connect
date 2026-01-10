@@ -29,18 +29,21 @@ public class TableSinkConfig {
   private final List<String> partitionBy;
   private final String commitBranch;
   private final boolean appendOnly;
+  private final Boolean hasRealPk;
 
   public TableSinkConfig(
       Pattern routeRegex,
       List<String> idColumns,
       List<String> partitionBy,
       String commitBranch,
-      boolean appendOnly) {
+      boolean appendOnly,
+      Boolean hasRealPk) {
     this.routeRegex = routeRegex;
     this.idColumns = idColumns;
     this.partitionBy = partitionBy;
     this.commitBranch = commitBranch;
     this.appendOnly = appendOnly;
+    this.hasRealPk = hasRealPk;
   }
 
   public Optional<Pattern> routeRegex() {
@@ -61,5 +64,15 @@ public class TableSinkConfig {
 
   public boolean appendOnly() {
     return appendOnly;
+  }
+
+  /**
+   * Returns explicit has-real-pk config value.
+   * null = not configured (auto-detect)
+   * true = table has real PK (use identifier fields)
+   * false = table has no real PK (use all columns for equality delete)
+   */
+  public Optional<Boolean> hasRealPk() {
+    return Optional.ofNullable(hasRealPk);
   }
 }

@@ -58,6 +58,7 @@ public class IcebergSinkConfig extends AbstractConfig {
   private static final String PARTITION_BY = "partition-by";
   private static final String COMMIT_BRANCH = "commit-branch";
   private static final String APPEND_ONLY = "append-only";
+  private static final String HAS_REAL_PK = "has-real-pk";
 
   private static final String CATALOG_PROP_PREFIX = "iceberg.catalog.";
   private static final String HADOOP_PROP_PREFIX = "iceberg.hadoop.";
@@ -381,7 +382,10 @@ public class IcebergSinkConfig extends AbstractConfig {
           boolean appendOnly =
               Boolean.parseBoolean(tableConfig.getOrDefault(APPEND_ONLY, "false"));
 
-          return new TableSinkConfig(routeRegex, idColumns, partitionBy, commitBranch, appendOnly);
+          String hasRealPkStr = tableConfig.get(HAS_REAL_PK);
+          Boolean hasRealPk = hasRealPkStr == null ? null : Boolean.parseBoolean(hasRealPkStr);
+
+          return new TableSinkConfig(routeRegex, idColumns, partitionBy, commitBranch, appendOnly, hasRealPk);
         });
   }
 
