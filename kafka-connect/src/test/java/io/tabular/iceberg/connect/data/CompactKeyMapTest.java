@@ -201,6 +201,36 @@ public class CompactKeyMapTest {
   }
 
   @Test
+  public void testUuidWithHighBitSet() {
+    // UUID with high bit set (first hex digit >= 8) should still work
+    CompactKeyMap map = CompactKeyMap.create(STRING_KEY_SCHEMA);
+
+    // With dashes - high bit in first segment
+    Record key1 = GenericRecord.create(STRING_KEY_SCHEMA);
+    key1.setField("id", "ffffffff-ffff-ffff-ffff-ffffffffffff");
+
+    assertThat(map.put(key1, "/path/file.parquet", 1)).isNull();
+    assertThat(map.size()).isEqualTo(1);
+
+    CompactKeyMap.PathOffset old = map.put(key1, "/path/file.parquet", 2);
+    assertThat(old).isNotNull();
+    assertThat(old.position).isEqualTo(1);
+
+    map.clear();
+
+    // Without dashes - this was the bug case
+    Record key2 = GenericRecord.create(STRING_KEY_SCHEMA);
+    key2.setField("id", "ffffffffffffffffffffffffffffffff");
+
+    assertThat(map.put(key2, "/path/file.parquet", 10)).isNull();
+    assertThat(map.size()).isEqualTo(1);
+
+    old = map.put(key2, "/path/file.parquet", 20);
+    assertThat(old).isNotNull();
+    assertThat(old.position).isEqualTo(10);
+  }
+
+  @Test
   public void testDecimalKeyPutGetRemove() {
     CompactKeyMap map = CompactKeyMap.create(DECIMAL_KEY_SCHEMA);
 
@@ -327,5 +357,65 @@ public class CompactKeyMapTest {
     CompactKeyMap.PathOffset old = map.put(keyLong, "/path/file.parquet", 2);
     assertThat(old).isNotNull();
     assertThat(old.position).isEqualTo(1);
+  }
+
+  @Test
+  public void testUuidFallbackToStringOnNonUuid() {
+    CompactKeyMap map = CompactKeyMap.create(STRING_KEY_SCHEMA);
+
+    // First value is UUID - triggers UuidKeyMap
+    Record uuidKey1 = GenericRecord.create(STRING_KEY_SCHEMA);
+    uuidKey1.setField("id", "550e8400-e29b-41d4-a716-446655440000");
+
+    Record uuidKey2 = GenericRecord.create(STRING_KEY_SCHEMA);
+    uuidKey2.setField("id", "550e8400-e29b-41d4-a716-446655440001");
+
+    assertThat(map.put(uuidKey1, "/path/file1.parquet", 100)).isNull();
+    assertThat(map.put(uuidKey2, "/path/file2.parquet", 200)).isNull();
+    assertThat(map.size()).isEqualTo(2);
+
+    // Now insert non-UUID - should trigger fallback to StringKeyMap
+    Record nonUuidKey = GenericRecord.create(STRING_KEY_SCHEMA);
+    nonUuidKey.setField("id", "not-a-uuid-string");
+
+    assertThat(map.put(nonUuidKey, "/path/file3.parquet", 300)).isNull();
+    assertThat(map.size()).isEqualTo(3);
+
+    // Verify all keys still accessible after migration
+    CompactKeyMap.PathOffset old = map.put(uuidKey1, "/path/file1.parquet", 101);
+    assertThat(old).isNotNull();
+    assertThat(old.position).isEqualTo(100);
+
+    old = map.put(uuidKey2, "/path/file2.parquet", 201);
+    assertThat(old).isNotNull();
+    assertThat(old.position).isEqualTo(200);
+
+    old = map.put(nonUuidKey, "/path/file3.parquet", 301);
+    assertThat(old).isNotNull();
+    assertThat(old.position).isEqualTo(300);
+
+    // Remove all
+    assertThat(map.remove(uuidKey1)).isNotNull();
+    assertThat(map.remove(uuidKey2)).isNotNull();
+    assertThat(map.remove(nonUuidKey)).isNotNull();
+    assertThat(map.size()).isEqualTo(0);
+  }
+
+  @Test
+  public void testUuidFallbackRemoveNonExistentNonUuid() {
+    CompactKeyMap map = CompactKeyMap.create(STRING_KEY_SCHEMA);
+
+    // Start with UUID
+    Record uuidKey = GenericRecord.create(STRING_KEY_SCHEMA);
+    uuidKey.setField("id", "550e8400-e29b-41d4-a716-446655440000");
+    map.put(uuidKey, "/path/file.parquet", 100);
+
+    // Try to remove non-UUID that was never inserted (before fallback)
+    Record nonUuidKey = GenericRecord.create(STRING_KEY_SCHEMA);
+    nonUuidKey.setField("id", "not-a-uuid");
+
+    // Should return null - key doesn't exist
+    assertThat(map.remove(nonUuidKey)).isNull();
+    assertThat(map.size()).isEqualTo(1);
   }
 }

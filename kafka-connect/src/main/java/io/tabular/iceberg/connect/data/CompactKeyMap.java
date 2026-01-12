@@ -90,6 +90,71 @@ public abstract class CompactKeyMap {
     return new PathOffset(pathIndex, position);
   }
 
+  /**
+   * Try to parse a string as UUID. Returns two longs [high, low] if valid UUID, null otherwise.
+   * Supports both formats: with dashes (36 chars) and without (32 chars).
+   */
+  protected static long[] tryParseUuid(String s) {
+    if (s == null) {
+      return null;
+    }
+    int len = s.length();
+    if (len == 36) {
+      // With dashes: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+      if (s.charAt(8) != '-' || s.charAt(13) != '-'
+          || s.charAt(18) != '-' || s.charAt(23) != '-') {
+        return null;
+      }
+      long p0 = parseHexSegment(s, 0, 8);
+      long p1 = parseHexSegment(s, 9, 13);
+      long p2 = parseHexSegment(s, 14, 18);
+      long p3 = parseHexSegment(s, 19, 23);
+      long p4 = parseHexSegment(s, 24, 36);
+      if (p0 < 0 || p1 < 0 || p2 < 0 || p3 < 0 || p4 < 0) {
+        return null;
+      }
+      long high = (p0 << 32) | (p1 << 16) | p2;
+      long low = (p3 << 48) | p4;
+      return new long[] {high, low};
+    } else if (len == 32) {
+      // Without dashes: split into smaller segments to avoid overflow issues
+      long p0 = parseHexSegment(s, 0, 8);
+      long p1 = parseHexSegment(s, 8, 12);
+      long p2 = parseHexSegment(s, 12, 16);
+      long p3 = parseHexSegment(s, 16, 20);
+      long p4 = parseHexSegment(s, 20, 32);
+      if (p0 < 0 || p1 < 0 || p2 < 0 || p3 < 0 || p4 < 0) {
+        return null;
+      }
+      long high = (p0 << 32) | (p1 << 16) | p2;
+      long low = (p3 << 48) | p4;
+      return new long[] {high, low};
+    }
+    return null;
+  }
+
+  /**
+   * Parse hex segment. Returns -1 if any character is not a valid hex digit.
+   */
+  private static long parseHexSegment(String s, int start, int end) {
+    long result = 0;
+    for (int i = start; i < end; i++) {
+      char c = s.charAt(i);
+      int digit;
+      if (c >= '0' && c <= '9') {
+        digit = c - '0';
+      } else if (c >= 'a' && c <= 'f') {
+        digit = c - 'a' + 10;
+      } else if (c >= 'A' && c <= 'F') {
+        digit = c - 'A' + 10;
+      } else {
+        return -1;
+      }
+      result = (result << 4) | digit;
+    }
+    return result;
+  }
+
   /** Creates a CompactKeyMap optimized for the given equality delete schema. */
   public static CompactKeyMap create(Schema deleteSchema) {
     return create(deleteSchema, true);
@@ -325,7 +390,7 @@ public abstract class CompactKeyMap {
     public PathOffset put(Record key, String path, int position) {
       String k = key.get(0, Object.class).toString();
       if (delegate == null) {
-        delegate = isUuid(k) ? new UuidKeyMap() : new StringKeyMap();
+        delegate = (tryParseUuid(k) != null) ? new UuidKeyMap() : new StringKeyMap();
         // Copy path interning to delegate
         delegate.paths.addAll(this.paths);
         delegate.pathToIndex.putAll(this.pathToIndex);
@@ -360,40 +425,13 @@ public abstract class CompactKeyMap {
     public String getPath(int index) {
       return delegate != null ? delegate.getPath(index) : super.getPath(index);
     }
-
-    private static boolean isUuid(String s) {
-      // UUID format: 8-4-4-4-12 = 36 chars with dashes, or 32 without
-      if (s == null) return false;
-      int len = s.length();
-      if (len == 36) {
-        // With dashes: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-        return s.charAt(8) == '-' && s.charAt(13) == '-'
-            && s.charAt(18) == '-' && s.charAt(23) == '-'
-            && isHexString(s, 0, 8) && isHexString(s, 9, 13)
-            && isHexString(s, 14, 18) && isHexString(s, 19, 23)
-            && isHexString(s, 24, 36);
-      } else if (len == 32) {
-        // Without dashes
-        return isHexString(s, 0, 32);
-      }
-      return false;
-    }
-
-    private static boolean isHexString(String s, int start, int end) {
-      for (int i = start; i < end; i++) {
-        char c = s.charAt(i);
-        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
-          return false;
-        }
-      }
-      return true;
-    }
   }
 
   // ==================== UUID key: two longs ====================
 
   /**
    * UUID stored as two longs. ~24 bytes per entry vs ~83 bytes for String.
+   * Falls back to StringKeyMap if a non-UUID value is encountered.
    */
   static class UuidKeyMap extends CompactKeyMap {
     private static final int INITIAL_CAPACITY = 1024;
@@ -406,6 +444,7 @@ public abstract class CompactKeyMap {
     private long[] values;
     private int size;
     private int threshold;
+    private StringKeyMap fallback;
 
     UuidKeyMap() {
       highBits = new long[INITIAL_CAPACITY];
@@ -417,8 +456,15 @@ public abstract class CompactKeyMap {
 
     @Override
     public PathOffset put(Record key, String path, int position) {
+      if (fallback != null) {
+        return fallback.put(key, path, position);
+      }
       String k = key.get(0, Object.class).toString();
-      long[] uuid = parseUuid(k);
+      long[] uuid = tryParseUuid(k);
+      if (uuid == null) {
+        migrateToFallback();
+        return fallback.put(key, path, position);
+      }
       return putInternal(uuid[0], uuid[1], internPath(path), position);
     }
 
@@ -450,8 +496,14 @@ public abstract class CompactKeyMap {
 
     @Override
     public PathOffset remove(Record key) {
+      if (fallback != null) {
+        return fallback.remove(key);
+      }
       String k = key.get(0, Object.class).toString();
-      long[] uuid = parseUuid(k);
+      long[] uuid = tryParseUuid(k);
+      if (uuid == null) {
+        return null; // non-UUID key can't exist in UUID map
+      }
       long high = uuid[0], low = uuid[1];
 
       int mask = highBits.length - 1;
@@ -500,51 +552,62 @@ public abstract class CompactKeyMap {
       }
     }
 
-    /** Parse UUID string to two longs (high, low). */
-    private static long[] parseUuid(String s) {
-      long high, low;
-      if (s.length() == 36) {
-        // With dashes: 8-4-4-4-12
-        high = (parseHex(s, 0, 8) << 32) | (parseHex(s, 9, 13) << 16) | parseHex(s, 14, 18);
-        low = (parseHex(s, 19, 23) << 48) | parseHex(s, 24, 36);
-      } else {
-        // Without dashes: 32 chars
-        high = parseHex(s, 0, 16);
-        low = parseHex(s, 16, 32);
+    private void migrateToFallback() {
+      fallback = new StringKeyMap();
+      fallback.paths.addAll(this.paths);
+      fallback.pathToIndex.putAll(this.pathToIndex);
+
+      // Re-insert all existing entries as strings
+      for (int i = 0; i < highBits.length; i++) {
+        long high = highBits[i];
+        if (high != EMPTY && high != TOMBSTONE_MARKER) {
+          String uuidStr = formatUuid(high, lowBits[i]);
+          long packed = values[i];
+          int pathIndex = (int) (packed >>> 32);
+          int position = (int) packed;
+          fallback.putInternal(uuidStr, pathIndex, position);
+        }
       }
-      return new long[] {high, low};
+
+      // Release UUID storage
+      highBits = null;
+      lowBits = null;
+      values = null;
+      size = 0;
     }
 
-    private static long parseHex(String s, int start, int end) {
-      long result = 0;
-      for (int i = start; i < end; i++) {
-        char c = s.charAt(i);
-        int digit;
-        if (c >= '0' && c <= '9') {
-          digit = c - '0';
-        } else if (c >= 'a' && c <= 'f') {
-          digit = c - 'a' + 10;
-        } else if (c >= 'A' && c <= 'F') {
-          digit = c - 'A' + 10;
-        } else {
-          continue; // skip dashes
-        }
-        result = (result << 4) | digit;
-      }
-      return result;
+    private static String formatUuid(long high, long low) {
+      return String.format(
+          "%08x-%04x-%04x-%04x-%012x",
+          (high >>> 32) & 0xFFFFFFFFL,
+          (high >>> 16) & 0xFFFFL,
+          high & 0xFFFFL,
+          (low >>> 48) & 0xFFFFL,
+          low & 0xFFFFFFFFFFFFL);
     }
 
     @Override
     public int size() {
-      return size;
+      return fallback != null ? fallback.size() : size;
     }
 
     @Override
     public void clear() {
-      Arrays.fill(highBits, EMPTY);
+      if (fallback != null) {
+        fallback.clear();
+        fallback = null;
+      }
+      if (highBits != null) {
+        Arrays.fill(highBits, EMPTY);
+      }
       size = 0;
       paths.clear();
       pathToIndex.clear();
+    }
+
+    @Override
+    public String getPath(int index) {
+      return fallback != null ? fallback.getPath(index) : super.getPath(index);
     }
   }
 
