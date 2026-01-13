@@ -40,4 +40,5 @@ public interface CdcConstants {
   String COL_BINLOG_POS = "binlog_pos";
   String COL_PG_TXID = "pgtxid";
   String COL_LSN = "lsn";
+  String COL_SNAPSHOT = "snapshot";
 }

@@ -269,6 +269,14 @@ public class DebeziumTransform<R extends ConnectRecord<R>> implements Transforma
         cdcMetadata.put(CdcConstants.COL_LSN, ((Number) lsn).longValue());
       }
     }
+
+    // Snapshot indicator
+    if (sourceSchema.field("snapshot") != null) {
+      Object snapshot = source.get("snapshot");
+      if (snapshot != null) {
+        cdcMetadata.put(CdcConstants.COL_SNAPSHOT, snapshot.toString());
+      }
+    }
   }
 
   private void setTableTargetFromTopic(String topic, Struct cdcMetadata) {
@@ -330,6 +338,12 @@ public class DebeziumTransform<R extends ConnectRecord<R>> implements Transforma
     if (lsn != null) {
       cdcMetadata.put(CdcConstants.COL_LSN, ((Number) lsn).longValue());
     }
+
+    // Snapshot indicator
+    Object snapshot = source.get("snapshot");
+    if (snapshot != null) {
+      cdcMetadata.put(CdcConstants.COL_SNAPSHOT, snapshot.toString());
+    }
   }
 
   private String target(String db, String table) {
@@ -352,7 +366,8 @@ public class DebeziumTransform<R extends ConnectRecord<R>> implements Transforma
             .field(CdcConstants.COL_BINLOG_FILE, Schema.OPTIONAL_STRING_SCHEMA)
             .field(CdcConstants.COL_BINLOG_POS, Schema.OPTIONAL_INT64_SCHEMA)
             .field(CdcConstants.COL_PG_TXID, Schema.OPTIONAL_INT64_SCHEMA)
-            .field(CdcConstants.COL_LSN, Schema.OPTIONAL_INT64_SCHEMA);
+            .field(CdcConstants.COL_LSN, Schema.OPTIONAL_INT64_SCHEMA)
+            .field(CdcConstants.COL_SNAPSHOT, Schema.OPTIONAL_STRING_SCHEMA);
 
     if (keySchema != null) {
       builder.field(CdcConstants.COL_KEY, keySchema);
