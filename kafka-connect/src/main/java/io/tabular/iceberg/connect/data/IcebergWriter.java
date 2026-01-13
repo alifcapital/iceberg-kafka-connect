@@ -46,16 +46,18 @@ public class IcebergWriter implements RecordWriter {
   private final Table table;
   private final String tableName;
   private final IcebergSinkConfig config;
+  private final boolean hasReliablePk;
   private final List<WriterResult> writerResults;
   private final Map<TopicPartition, Offset> dataOffsets;
 
   private RecordConverter recordConverter;
   private TaskWriter<Record> writer;
 
-  public IcebergWriter(Table table, String tableName, IcebergSinkConfig config) {
+  public IcebergWriter(Table table, String tableName, IcebergSinkConfig config, boolean hasReliablePk) {
     this.table = table;
     this.tableName = tableName;
     this.config = config;
+    this.hasReliablePk = hasReliablePk;
     this.writerResults = Lists.newArrayList();
     this.dataOffsets = Maps.newHashMap();
     initNewWriter();
@@ -63,7 +65,9 @@ public class IcebergWriter implements RecordWriter {
 
   private void initNewWriter() {
     this.writer = Utilities.createTableWriter(table, tableName, config);
-    this.recordConverter = new RecordConverter(table, config);
+    // In append mode without reliable PK, write _before_image as _cdc_before_image to Iceberg
+    boolean writeBeforeImageToIceberg = config.tablesCdcField() == null && !hasReliablePk;
+    this.recordConverter = new RecordConverter(table, config, writeBeforeImageToIceberg);
   }
 
   @Override

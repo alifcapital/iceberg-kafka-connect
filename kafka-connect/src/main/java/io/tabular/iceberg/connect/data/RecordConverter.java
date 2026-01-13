@@ -83,12 +83,18 @@ public class RecordConverter {
   private final IcebergSinkConfig config;
   private final Set<Integer> identifierFieldIds;
   private final Map<Integer, Map<String, NestedField>> structNameMap = Maps.newHashMap();
+  private final boolean writeBeforeImageToIceberg;
 
   public RecordConverter(Table table, IcebergSinkConfig config) {
+    this(table, config, false);
+  }
+
+  public RecordConverter(Table table, IcebergSinkConfig config, boolean writeBeforeImageToIceberg) {
     this.tableSchema = table.schema();
     this.nameMapping = createNameMapping(table);
     this.config = config;
     this.identifierFieldIds = table.schema().identifierFieldIds();
+    this.writeBeforeImageToIceberg = writeBeforeImageToIceberg;
   }
 
   public Record convert(Object data) {
@@ -198,9 +204,15 @@ public class RecordConverter {
         (recordFieldNameObj, recordFieldValue) -> {
           String recordFieldName = recordFieldNameObj.toString();
 
-          // Skip _before_image - it's only used for delete logic, not stored in Iceberg
+          // Handle _before_image field
           if ("_before_image".equals(recordFieldName)) {
-            return;
+            if (writeBeforeImageToIceberg) {
+              // Rename to _cdc_before_image and write to Iceberg
+              recordFieldName = "_cdc_before_image";
+            } else {
+              // Skip - it's only used for delete logic, not stored in Iceberg
+              return;
+            }
           }
 
           NestedField tableField = lookupStructField(recordFieldName, schema, structFieldId);
@@ -256,19 +268,27 @@ public class RecordConverter {
     GenericRecord result = GenericRecord.create(schema);
 
     for (Field recordField : struct.schema().fields()) {
-      // Skip _before_image - it's only used for delete logic, not stored in Iceberg
-      if ("_before_image".equals(recordField.name())) {
-        continue;
+      String recordFieldName = recordField.name();
+
+      // Handle _before_image field
+      if ("_before_image".equals(recordFieldName)) {
+        if (writeBeforeImageToIceberg) {
+          // Rename to _cdc_before_image and write to Iceberg
+          recordFieldName = "_cdc_before_image";
+        } else {
+          // Skip - it's only used for delete logic, not stored in Iceberg
+          continue;
+        }
       }
 
-      NestedField tableField = lookupStructField(recordField.name(), schema, structFieldId);
+      NestedField tableField = lookupStructField(recordFieldName, schema, structFieldId);
       if (tableField == null) {
         // add the column if schema evolution is on, otherwise skip the value
         if (schemaUpdateConsumer != null) {
           String parentFieldName =
               structFieldId < 0 ? null : tableSchema.findColumnName(structFieldId);
           Type type = SchemaUtils.toIcebergType(recordField.schema(), config);
-          schemaUpdateConsumer.addColumn(parentFieldName, recordField.name(), type);
+          schemaUpdateConsumer.addColumn(parentFieldName, recordFieldName, type);
         }
       } else {
         if (schemaUpdateConsumer != null) {

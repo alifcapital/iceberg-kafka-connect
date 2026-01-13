@@ -51,6 +51,17 @@ public class IcebergWriterFactory {
     this.config = config;
   }
 
+  /**
+   * Check if Kafka key schema has all NOT NULL fields (reliable PK).
+   */
+  private static boolean hasReliablePk(SinkRecord sample) {
+    if (sample.keySchema() == null) {
+      return false;
+    }
+    return sample.keySchema().fields().stream()
+        .noneMatch(field -> field.schema().isOptional());
+  }
+
   public RecordWriter createWriter(
           String tableName, SinkRecord sample, boolean ignoreMissingTable) {
     TableIdentifier identifier = TableIdentifier.parse(tableName);
@@ -67,7 +78,7 @@ public class IcebergWriterFactory {
       }
     }
 
-    return new IcebergWriter(table, tableName, config);
+    return new IcebergWriter(table, tableName, config, hasReliablePk(sample));
   }
 
   @VisibleForTesting
@@ -95,23 +106,19 @@ public class IcebergWriterFactory {
           LOG.info("Table {} configured with has-real-pk=false, will use all columns for equality delete", tableName);
         } else {
           // Get PK from Kafka topic key
-          if (sample.keySchema() != null) {
-            boolean allKeysRequired = sample.keySchema().fields().stream()
-                .noneMatch(field -> field.schema().isOptional());
-            if (allKeysRequired) {
-              equalityFieldIds =
-                  sample.keySchema().fields().stream()
-                    .map(col -> structType.field(col.name()).fieldId())
-                    .collect(toSet());
-            } else {
-              // Keys are nullable - fail unless explicitly configured
-              throw new DataException(String.format(
-                  "Table %s has nullable key fields which cannot be used as identifier fields. "
-                  + "Iceberg requires identifier fields to be NOT NULL. "
-                  + "To use all columns for equality delete (before/after image mode), "
-                  + "set iceberg.table.%s.has-real-pk=false",
-                  tableName, tableName));
-            }
+          if (hasReliablePk(sample)) {
+            equalityFieldIds =
+                sample.keySchema().fields().stream()
+                  .map(col -> structType.field(col.name()).fieldId())
+                  .collect(toSet());
+          } else if (sample.keySchema() != null) {
+            // Keys are nullable - fail unless explicitly configured
+            throw new DataException(String.format(
+                "Table %s has nullable key fields which cannot be used as identifier fields. "
+                + "Iceberg requires identifier fields to be NOT NULL. "
+                + "To use all columns for equality delete (before/after image mode), "
+                + "set iceberg.table.%s.has-real-pk=false",
+                tableName, tableName));
           }
           // Override PK with table config
           List<String> idCols = config.tableConfig(tableName).idColumns();
