@@ -64,6 +64,7 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
   private final SinkTaskContext context;
   private final IcebergSinkConfig config;
   private final Optional<CoordinatorThread> maybeCoordinatorThread;
+  private final CommitterWatchdog watchdog;
 
   public CommitterImpl(SinkTaskContext context, IcebergSinkConfig config, Catalog catalog) {
     this(context, config, catalog, new KafkaClientFactory(config.kafkaProps()));
@@ -113,6 +114,10 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
                 envelope,
                 // CommittableSupplier that always returns empty committables
                 () -> new Committable(ImmutableMap.of(), ImmutableList.of(), ImmutableMap.of())));
+
+    this.watchdog =
+        new CommitterWatchdog(admin(), config.connectGroupId(), Thread.currentThread());
+    this.watchdog.start();
   }
 
   private Map<TopicPartition, Long> fetchStableConsumerOffsets(String groupId) {
@@ -232,11 +237,16 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
   @Override
   public void commit(CommittableSupplier committableSupplier) {
     throwExceptionIfCoordinatorIsTerminated();
+    if (watchdog.isDead()) {
+      throw new ConnectException(
+          "SinkTask consumer health check failed: " + watchdog.deadReason());
+    }
     consumeAvailable(Duration.ZERO, envelope -> receive(envelope, committableSupplier));
   }
 
   @Override
   public void close() throws IOException {
+    watchdog.stop();
     stop();
     maybeCoordinatorThread.ifPresent(CoordinatorThread::terminate);
   }
