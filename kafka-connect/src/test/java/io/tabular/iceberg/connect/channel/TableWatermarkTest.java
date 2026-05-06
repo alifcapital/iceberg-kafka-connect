@@ -27,7 +27,7 @@ import org.junit.jupiter.api.Test;
 public class TableWatermarkTest {
 
   @Test
-  public void schemaHasAllNineFields() {
+  public void schemaHasAllElevenFields() {
     assertThat(TableWatermark.SCHEMA.getFields())
         .extracting(Schema.Field::name)
         .containsExactly(
@@ -39,7 +39,9 @@ public class TableWatermarkTest {
             "last_consumed_offset",
             "last_consumed_event_time",
             "last_kafka_offset",
-            "last_kafka_event_time");
+            "last_kafka_event_time",
+            "iceberg_snapshot_id",
+            "iceberg_committed_at");
   }
 
   @Test
@@ -49,7 +51,9 @@ public class TableWatermarkTest {
           "last_consumed_offset",
           "last_consumed_event_time",
           "last_kafka_offset",
-          "last_kafka_event_time"
+          "last_kafka_event_time",
+          "iceberg_snapshot_id",
+          "iceberg_committed_at"
         }) {
       Schema fieldSchema = TableWatermark.SCHEMA.getField(name).schema();
       assertThat(fieldSchema.getType()).isEqualTo(Schema.Type.UNION);
@@ -71,7 +75,9 @@ public class TableWatermarkTest {
             123L,
             1700000000123L,
             999L,
-            1700000000999L);
+            1700000000999L,
+            8123456789012345678L,
+            1700000000500L);
 
     assertThat(rec.get("db")).isEqualTo("landing_db");
     assertThat(rec.get("table")).isEqualTo("terminals");
@@ -82,16 +88,20 @@ public class TableWatermarkTest {
     assertThat(rec.get("last_consumed_event_time")).isEqualTo(1700000000123L);
     assertThat(rec.get("last_kafka_offset")).isEqualTo(999L);
     assertThat(rec.get("last_kafka_event_time")).isEqualTo(1700000000999L);
+    assertThat(rec.get("iceberg_snapshot_id")).isEqualTo(8123456789012345678L);
+    assertThat(rec.get("iceberg_committed_at")).isEqualTo(1700000000500L);
   }
 
   @Test
   public void buildAcceptsNullsForIdleAndEmptyTopic() {
     GenericRecord rec =
         TableWatermark.build(
-            "db", "tbl", "cid", 1L, "topic", null, null, null, null);
+            "db", "tbl", "cid", 1L, "topic", null, null, null, null, null, null);
     assertThat(rec.get("last_consumed_offset")).isNull();
     assertThat(rec.get("last_consumed_event_time")).isNull();
     assertThat(rec.get("last_kafka_offset")).isNull();
     assertThat(rec.get("last_kafka_event_time")).isNull();
+    assertThat(rec.get("iceberg_snapshot_id")).isNull();
+    assertThat(rec.get("iceberg_committed_at")).isNull();
   }
 }

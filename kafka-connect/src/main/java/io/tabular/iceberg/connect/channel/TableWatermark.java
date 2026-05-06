@@ -69,6 +69,16 @@ final class TableWatermark {
           .nullable()
           .longType()
           .noDefault()
+          .name("iceberg_snapshot_id")
+          .type()
+          .nullable()
+          .longType()
+          .noDefault()
+          .name("iceberg_committed_at")
+          .type()
+          .nullable()
+          .longType()
+          .noDefault()
           .endRecord();
 
   private TableWatermark() {}
@@ -82,7 +92,9 @@ final class TableWatermark {
       Long lastConsumedOffset,
       Long lastConsumedEventTime,
       Long lastKafkaOffset,
-      Long lastKafkaEventTime) {
+      Long lastKafkaEventTime,
+      Long icebergSnapshotId,
+      Long icebergCommittedAt) {
     GenericRecord rec = new GenericData.Record(SCHEMA);
     rec.put("db", db);
     rec.put("table", table);
@@ -93,6 +105,8 @@ final class TableWatermark {
     rec.put("last_consumed_event_time", lastConsumedEventTime);
     rec.put("last_kafka_offset", lastKafkaOffset);
     rec.put("last_kafka_event_time", lastKafkaEventTime);
+    rec.put("iceberg_snapshot_id", icebergSnapshotId);
+    rec.put("iceberg_committed_at", icebergCommittedAt);
     return rec;
   }
 }

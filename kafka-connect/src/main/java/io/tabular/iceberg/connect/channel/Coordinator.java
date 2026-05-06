@@ -240,7 +240,9 @@ public class Coordinator extends Channel implements AutoCloseable {
     send(event);
 
     if (!partialCommit) {
-      publishWatermarks(dataOffsetsSnapshot);
+      Map<TableIdentifier, Snapshot> committedSnapshots =
+          captureCommittedSnapshots(commitMap.keySet());
+      publishWatermarks(dataOffsetsSnapshot, committedSnapshots);
     }
 
     LOG.info(
@@ -250,7 +252,29 @@ public class Coordinator extends Channel implements AutoCloseable {
         vtts);
   }
 
-  void publishWatermarks(List<Envelope> dataOffsetsSnapshot) {
+  private Map<TableIdentifier, Snapshot> captureCommittedSnapshots(Set<TableIdentifier> tables) {
+    String currentCommitId = commitState.currentCommitId().toString();
+    Map<TableIdentifier, Snapshot> result = Maps.newHashMap();
+    for (TableIdentifier tableId : tables) {
+      try {
+        Table t = catalog.loadTable(tableId);
+        Snapshot snapshot = t.currentSnapshot();
+        // Snapshot belongs to THIS cycle only if its summary carries our current commit-id.
+        // If the per-table commit was skipped (no data/delete files after dedup), the table's
+        // currentSnapshot is the previous one and must not be recorded as ours.
+        if (snapshot != null
+            && currentCommitId.equals(snapshot.summary().get(COMMIT_ID_SNAPSHOT_PROP))) {
+          result.put(tableId, snapshot);
+        }
+      } catch (Exception e) {
+        LOG.warn("Failed to capture iceberg snapshot for {} (skipping in watermark)", tableId, e);
+      }
+    }
+    return result;
+  }
+
+  void publishWatermarks(
+      List<Envelope> dataOffsetsSnapshot, Map<TableIdentifier, Snapshot> committedSnapshots) {
     if (terminated
         || watermarkProducer == null
         || watermarkTopic == null
@@ -287,7 +311,8 @@ public class Coordinator extends Channel implements AutoCloseable {
                 commitTime,
                 activeByTable.get(entry.getKey()),
                 latestResult.get(entry.getValue()),
-                maxTsResult.get(entry.getValue())));
+                maxTsResult.get(entry.getValue()),
+                committedSnapshots.get(entry.getKey())));
       }
       // wait for the broker to ack every send so silent serializer / SR / broker failures
       // surface here instead of being lost in the producer's internal callback queue
@@ -336,7 +361,8 @@ public class Coordinator extends Channel implements AutoCloseable {
       long commitTime,
       Map<TopicPartition, io.tabular.iceberg.connect.events.TopicPartitionOffset> tableActive,
       ListOffsetsResult.ListOffsetsResultInfo latest,
-      ListOffsetsResult.ListOffsetsResultInfo maxTs) {
+      ListOffsetsResult.ListOffsetsResultInfo maxTs,
+      Snapshot icebergSnapshot) {
     String db = String.join(".", tableId.namespace().levels());
     String table = tableId.name();
 
@@ -346,6 +372,9 @@ public class Coordinator extends Channel implements AutoCloseable {
 
     Long lastKafkaOffset = computeLastKafkaOffset(latest, maxTs);
     Long lastKafkaEventTime = computeLastKafkaEventTime(maxTs);
+
+    Long icebergSnapshotId = icebergSnapshot == null ? null : icebergSnapshot.snapshotId();
+    Long icebergCommittedAt = icebergSnapshot == null ? null : icebergSnapshot.timestampMillis();
 
     org.apache.avro.generic.GenericRecord record =
         TableWatermark.build(
@@ -357,7 +386,9 @@ public class Coordinator extends Channel implements AutoCloseable {
             lastConsumedOffset,
             lastConsumedEventTime,
             lastKafkaOffset,
-            lastKafkaEventTime);
+            lastKafkaEventTime,
+            icebergSnapshotId,
+            icebergCommittedAt);
 
     String key = db + "." + table;
     return watermarkProducer.send(new ProducerRecord<>(watermarkTopic, key, record));
