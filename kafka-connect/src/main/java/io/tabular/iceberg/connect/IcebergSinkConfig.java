@@ -26,6 +26,7 @@ import java.nio.file.Paths;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Properties;
 import java.util.regex.Pattern;
 import org.apache.iceberg.IcebergBuild;
@@ -89,6 +90,14 @@ public class IcebergSinkConfig extends AbstractConfig {
       "iceberg.tables.schema-debezium-time-types";
   private static final String CONTROL_TOPIC_PROP = "iceberg.control.topic";
   private static final String CONTROL_GROUP_ID_PROP = "iceberg.control.group-id";
+  private static final String WATERMARK_TOPIC_PROP = "iceberg.watermark.topic";
+  private static final String CONNECT_TOPICS_PROP = "topics";
+  private static final String CONNECT_TOPICS_REGEX_PROP = "topics.regex";
+  private static final String CONNECT_TRANSFORMS_PROP = "transforms";
+  private static final String DEBEZIUM_TRANSFORM_TYPE =
+      "io.tabular.iceberg.connect.transforms.DebeziumTransform";
+  private static final String DEBEZIUM_TRANSFORM_PATTERN_SUFFIX = ".cdc.target.pattern";
+  private static final String CONNECT_TRANSFORM_TYPE_SUFFIX = ".type";
   private static final String COMMIT_INTERVAL_MS_PROP = "iceberg.control.commit.interval-ms";
   private static final int COMMIT_INTERVAL_MS_DEFAULT = 300_000;
   private static final String COMMIT_TIMEOUT_MS_PROP = "iceberg.control.commit.timeout-ms";
@@ -211,6 +220,13 @@ public class IcebergSinkConfig extends AbstractConfig {
         DEFAULT_CONTROL_TOPIC,
         Importance.MEDIUM,
         "Name of the control topic");
+    configDef.define(
+        WATERMARK_TOPIC_PROP,
+        Type.STRING,
+        null,
+        Importance.MEDIUM,
+        "Name of the Kafka topic to publish per-table watermark messages to. "
+            + "If unset, watermark publishing is disabled.");
     configDef.define(
         CONTROL_GROUP_ID_PROP,
         Type.STRING,
@@ -414,6 +430,49 @@ public class IcebergSinkConfig extends AbstractConfig {
     String connectorName = connectorName();
     Preconditions.checkNotNull(connectorName, "Connector name cannot be null");
     return DEFAULT_CONTROL_GROUP_PREFIX + connectorName;
+  }
+
+  public String watermarkTopic() {
+    return getString(WATERMARK_TOPIC_PROP);
+  }
+
+  public Optional<Pattern> topicsRegex() {
+    String regex = originalProps.get(CONNECT_TOPICS_REGEX_PROP);
+    if (regex == null || regex.isEmpty()) {
+      return Optional.empty();
+    }
+    return Optional.of(Pattern.compile(regex));
+  }
+
+  public List<String> topicsList() {
+    String topics = originalProps.get(CONNECT_TOPICS_PROP);
+    if (topics == null || topics.isEmpty()) {
+      return ImmutableList.of();
+    }
+    return Arrays.stream(topics.split(",")).map(String::trim).collect(toList());
+  }
+
+  public Optional<String> debeziumTransformPattern() {
+    String transforms = originalProps.get(CONNECT_TRANSFORMS_PROP);
+    if (transforms == null || transforms.isEmpty()) {
+      return Optional.empty();
+    }
+    for (String rawName : transforms.split(",")) {
+      String name = rawName.trim();
+      if (name.isEmpty()) {
+        continue;
+      }
+      String typeKey = CONNECT_TRANSFORMS_PROP + "." + name + CONNECT_TRANSFORM_TYPE_SUFFIX;
+      if (DEBEZIUM_TRANSFORM_TYPE.equals(originalProps.get(typeKey))) {
+        String pattern =
+            originalProps.get(
+                CONNECT_TRANSFORMS_PROP + "." + name + DEBEZIUM_TRANSFORM_PATTERN_SUFFIX);
+        if (pattern != null && !pattern.isEmpty()) {
+          return Optional.of(pattern);
+        }
+      }
+    }
+    return Optional.empty();
   }
 
   public String connectGroupId() {

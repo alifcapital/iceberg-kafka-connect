@@ -88,4 +88,110 @@ public class IcebergSinkConfigTest {
 
   @Test
   public void testStringWithParensToList() {}
+
+  @Test
+  public void testWatermarkTopicDefaultsToNull() {
+    Map<String, String> props =
+        ImmutableMap.of(
+            "iceberg.catalog.type", "rest",
+            "topics", "t",
+            "iceberg.tables", "db.t");
+    IcebergSinkConfig config = new IcebergSinkConfig(props);
+    assertThat(config.watermarkTopic()).isNull();
+  }
+
+  @Test
+  public void testWatermarkTopicSet() {
+    Map<String, String> props =
+        ImmutableMap.of(
+            "iceberg.catalog.type", "rest",
+            "topics", "t",
+            "iceberg.tables", "db.t",
+            "iceberg.watermark.topic", "cdc.watermarks");
+    IcebergSinkConfig config = new IcebergSinkConfig(props);
+    assertThat(config.watermarkTopic()).isEqualTo("cdc.watermarks");
+  }
+
+  @Test
+  public void testTopicsList() {
+    Map<String, String> props =
+        ImmutableMap.of(
+            "iceberg.catalog.type", "rest",
+            "topics", "t1, t2 ,t3",
+            "iceberg.tables", "db.t");
+    IcebergSinkConfig config = new IcebergSinkConfig(props);
+    assertThat(config.topicsList()).containsExactly("t1", "t2", "t3");
+    assertThat(config.topicsRegex()).isEmpty();
+  }
+
+  @Test
+  public void testTopicsRegex() {
+    Map<String, String> props =
+        ImmutableMap.of(
+            "iceberg.catalog.type", "rest",
+            "topics.regex", "debezium_.*",
+            "iceberg.tables", "db.t");
+    IcebergSinkConfig config = new IcebergSinkConfig(props);
+    assertThat(config.topicsRegex()).isPresent();
+    assertThat(config.topicsRegex().get().matcher("debezium_x.public.t").matches()).isTrue();
+    assertThat(config.topicsRegex().get().matcher("other_x").matches()).isFalse();
+    assertThat(config.topicsList()).isEmpty();
+  }
+
+  @Test
+  public void testDebeziumTransformPatternFound() {
+    Map<String, String> props =
+        ImmutableMap.<String, String>builder()
+            .put("iceberg.catalog.type", "rest")
+            .put("topics", "t")
+            .put("iceberg.tables", "db.t")
+            .put("transforms", "dbz")
+            .put("transforms.dbz.type", "io.tabular.iceberg.connect.transforms.DebeziumTransform")
+            .put("transforms.dbz.cdc.target.pattern", "landing.{table}")
+            .build();
+    IcebergSinkConfig config = new IcebergSinkConfig(props);
+    assertThat(config.debeziumTransformPattern()).contains("landing.{table}");
+  }
+
+  @Test
+  public void testDebeziumTransformPatternMissing() {
+    Map<String, String> props =
+        ImmutableMap.of(
+            "iceberg.catalog.type", "rest",
+            "topics", "t",
+            "iceberg.tables", "db.t");
+    IcebergSinkConfig config = new IcebergSinkConfig(props);
+    assertThat(config.debeziumTransformPattern()).isEmpty();
+  }
+
+  @Test
+  public void testDebeziumTransformPatternWrongType() {
+    Map<String, String> props =
+        ImmutableMap.<String, String>builder()
+            .put("iceberg.catalog.type", "rest")
+            .put("topics", "t")
+            .put("iceberg.tables", "db.t")
+            .put("transforms", "x")
+            .put("transforms.x.type", "org.apache.kafka.connect.transforms.InsertField$Value")
+            .put("transforms.x.cdc.target.pattern", "landing.{table}")
+            .build();
+    IcebergSinkConfig config = new IcebergSinkConfig(props);
+    assertThat(config.debeziumTransformPattern()).isEmpty();
+  }
+
+  @Test
+  public void testDebeziumTransformPatternMultipleTransformsFindsDebezium() {
+    Map<String, String> props =
+        ImmutableMap.<String, String>builder()
+            .put("iceberg.catalog.type", "rest")
+            .put("topics", "t")
+            .put("iceberg.tables", "db.t")
+            .put("transforms", "ins, dbz")
+            .put("transforms.ins.type", "org.apache.kafka.connect.transforms.InsertField$Value")
+            .put("transforms.dbz.type", "io.tabular.iceberg.connect.transforms.DebeziumTransform")
+            .put("transforms.dbz.cdc.target.pattern", "landing.{table}")
+            .build();
+    IcebergSinkConfig config = new IcebergSinkConfig(props);
+    assertThat(config.debeziumTransformPattern()).contains("landing.{table}");
+  }
 }

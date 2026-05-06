@@ -32,34 +32,31 @@ import java.io.UncheckedIOException;
 import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.util.Collection;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import org.apache.iceberg.AppendFiles;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DeleteFile;
-import org.apache.iceberg.FileFormat;
-import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.RowDelta;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.Transaction;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.TableIdentifier;
-import org.apache.iceberg.data.GenericAppenderFactory;
-import org.apache.iceberg.data.GenericRecord;
-import org.apache.iceberg.data.Record;
 import org.apache.iceberg.exceptions.NoSuchTableException;
-import org.apache.iceberg.io.OutputFileFactory;
-import org.apache.iceberg.io.UnpartitionedWriter;
-import org.apache.iceberg.types.Types;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.util.Pair;
 import org.apache.iceberg.util.Tasks;
 import org.apache.iceberg.util.ThreadPools;
@@ -67,9 +64,18 @@ import org.apache.iceberg.connect.events.Event;
 import org.apache.iceberg.connect.events.StartCommit;
 import org.apache.iceberg.connect.events.CommitComplete;
 import org.apache.iceberg.connect.events.CommitToTable;
-import org.apache.iceberg.connect.events.DataWritten;
 import org.apache.iceberg.connect.events.TableReference;
+import io.confluent.kafka.serializers.KafkaAvroSerializer;
+import org.apache.kafka.clients.admin.ListOffsetsResult;
 import org.apache.kafka.clients.admin.MemberDescription;
+import org.apache.kafka.clients.admin.OffsetSpec;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.Producer;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.clients.producer.RecordMetadata;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.serialization.StringSerializer;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -90,6 +96,9 @@ public class Coordinator extends Channel implements AutoCloseable {
   private final String controlTopicOffsetsProp;
   private final ExecutorService exec;
   private final CommitState commitState;
+  private final String watermarkTopic;
+  private final Producer<String, Object> watermarkProducer;
+  private final TableTopicResolver tableTopicResolver;
   private volatile boolean terminated;
 
   public Coordinator(
@@ -109,8 +118,47 @@ public class Coordinator extends Channel implements AutoCloseable {
     this.exec = ThreadPools.newWorkerPool("iceberg-committer", config.commitThreads());
     this.commitState = new CommitState(config);
 
+    this.watermarkTopic = config.watermarkTopic();
+    if (watermarkTopic != null) {
+      this.watermarkProducer = createWatermarkProducer(config);
+      this.tableTopicResolver = new TableTopicResolver(admin(), config);
+      LOG.info("Watermark publishing enabled for topic '{}'", watermarkTopic);
+    } else {
+      this.watermarkProducer = null;
+      this.tableTopicResolver = null;
+    }
+
     // initial poll with longer duration so the consumer will initialize...
     consumeAvailable(Duration.ofMillis(1000), this::receive);
+  }
+
+  private static Producer<String, Object> createWatermarkProducer(IcebergSinkConfig config) {
+    Map<String, Object> props = Maps.newHashMap();
+    props.putAll(config.kafkaProps());
+    // KafkaAvroSerializer reads `schema.registry.url` etc. without a prefix, but Kafka Connect
+    // workers expose these as `value.converter.<key>` in their properties file. Carry them over
+    // unless they were explicitly set under `iceberg.kafka.*`.
+    inheritFromValueConverter(props, config.kafkaProps());
+    props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+    props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, KafkaAvroSerializer.class.getName());
+    props.put(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, true);
+    props.put(ProducerConfig.ACKS_CONFIG, "all");
+    return new KafkaProducer<>(props);
+  }
+
+  private static final String VALUE_CONVERTER_PREFIX = "value.converter.";
+
+  static void inheritFromValueConverter(Map<String, Object> props, Map<String, String> source) {
+    source.forEach(
+        (k, v) -> {
+          if (k.startsWith(VALUE_CONVERTER_PREFIX) && k.length() > VALUE_CONVERTER_PREFIX.length()) {
+            String stripped = k.substring(VALUE_CONVERTER_PREFIX.length());
+            if (!props.containsKey(stripped)) {
+              props.put(stripped, v);
+              LOG.debug("Inherited '{}' from '{}' for watermark producer", stripped, k);
+            }
+          }
+        });
   }
 
   public void process() {
@@ -172,10 +220,8 @@ public class Coordinator extends Channel implements AutoCloseable {
     Map<TableIdentifier, List<List<Envelope>>> commitMap = commitState.tableCommitMap();
 
     OffsetDateTime vtts = commitState.vtts(partialCommit);
-    String db = null;
-    if (!commitMap.isEmpty()) {
-        db = commitMap.entrySet().iterator().next().getKey().namespace().toString();
-    }
+
+    List<Envelope> dataOffsetsSnapshot = Lists.newArrayList(commitState.dataOffsetsBuffer());
 
     Tasks.foreach(commitMap.entrySet())
         .executeWith(exec)
@@ -193,8 +239,8 @@ public class Coordinator extends Channel implements AutoCloseable {
         new Event(config.controlGroupId(), new CommitComplete(commitState.currentCommitId(), vtts));
     send(event);
 
-    if (db != null && !partialCommit) {
-      logWatermark(db);
+    if (!partialCommit) {
+      publishWatermarks(dataOffsetsSnapshot);
     }
 
     LOG.info(
@@ -204,90 +250,175 @@ public class Coordinator extends Channel implements AutoCloseable {
         vtts);
   }
 
-  private void logWatermark(String db) {
-    if (db == null) {
-        LOG.warn("No database name available, skipping watermark logging");
-        return;
+  void publishWatermarks(List<Envelope> dataOffsetsSnapshot) {
+    if (terminated
+        || watermarkProducer == null
+        || watermarkTopic == null
+        || tableTopicResolver == null) {
+      return;
     }
-
-    UnpartitionedWriter<Record> writer = null;
-    boolean succeeded = false;
-
     try {
-        TableIdentifier watermarkTable = TableIdentifier.of("meta", "watermarks");
-        Table table;
+      Map<TableIdentifier, Map<TopicPartition, io.tabular.iceberg.connect.events.TopicPartitionOffset>>
+          activeByTable = collectActiveOffsets(dataOffsetsSnapshot);
+      Map<TableIdentifier, TopicPartition> tablesToPublish =
+          mergeKnownAndActive(tableTopicResolver.resolve(), activeByTable);
+      if (tablesToPublish.isEmpty()) {
+        return;
+      }
 
+      Set<TopicPartition> allTps = Sets.newHashSet(tablesToPublish.values());
+      Map<TopicPartition, ListOffsetsResult.ListOffsetsResultInfo> latestResult =
+          listOffsets(allTps, OffsetSpec.latest());
+      Map<TopicPartition, ListOffsetsResult.ListOffsetsResultInfo> maxTsResult =
+          listOffsets(allTps, OffsetSpec.maxTimestamp());
+
+      long commitTime = commitState.getStartTime();
+      String commitId = commitState.currentCommitId().toString();
+
+      List<TableIdentifier> sentTables = new ArrayList<>(tablesToPublish.size());
+      List<Future<RecordMetadata>> sentFutures = new ArrayList<>(tablesToPublish.size());
+      for (Map.Entry<TableIdentifier, TopicPartition> entry : tablesToPublish.entrySet()) {
+        sentTables.add(entry.getKey());
+        sentFutures.add(
+            sendWatermarkRecord(
+                entry.getKey(),
+                entry.getValue(),
+                commitId,
+                commitTime,
+                activeByTable.get(entry.getKey()),
+                latestResult.get(entry.getValue()),
+                maxTsResult.get(entry.getValue())));
+      }
+      // wait for the broker to ack every send so silent serializer / SR / broker failures
+      // surface here instead of being lost in the producer's internal callback queue
+      watermarkProducer.flush();
+      for (int i = 0; i < sentFutures.size(); i++) {
         try {
-            table = catalog.loadTable(watermarkTable);
-            LOG.debug("Found existing watermarks table");
-        } catch (NoSuchTableException e) {
-            LOG.info("Creating watermarks table in meta namespace");
-            org.apache.iceberg.Schema schema = new org.apache.iceberg.Schema(
-                Types.NestedField.required(1, "db", Types.StringType.get()),
-                Types.NestedField.required(2, "commit_start_time", Types.LongType.get()),
-                Types.NestedField.required(3, "commit_id", Types.StringType.get())
-            );
-
-            table = catalog.createTable(
-                watermarkTable,
-                schema,
-                PartitionSpec.unpartitioned(),
-                ImmutableMap.of()
-            );
+          sentFutures.get(i).get();
+        } catch (ExecutionException | InterruptedException ex) {
+          LOG.error(
+              "Failed to deliver watermark for table {} (commit {})",
+              sentTables.get(i),
+              commitState.currentCommitId(),
+              ex);
         }
-
-        OutputFileFactory fileFactory = OutputFileFactory.builderFor(table, 1, System.currentTimeMillis())
-            .defaultSpec(table.spec())
-            .operationId(UUID.randomUUID().toString())
-            .format(FileFormat.PARQUET)
-            .build();
-
-        GenericAppenderFactory appenderFactory = new GenericAppenderFactory(table.schema());
-        writer = new UnpartitionedWriter<>(
-            table.spec(),
-            FileFormat.PARQUET,
-            appenderFactory,
-            fileFactory,
-            table.io(),
-            2*1024*1024
-        );
-
-        Record record = GenericRecord.create(table.schema());
-        record.setField("db", db);
-        record.setField("commit_start_time", commitState.getStartTime());
-        record.setField("commit_id", commitState.currentCommitId().toString());
-
-        writer.write(record);
-        DataFile[] dataFiles = writer.dataFiles();
-        writer.close();
-        writer = null;  // prevent double-cleanup in finally block
-
-        AppendFiles appendFiles = table.newAppend();
-        for (DataFile dataFile : dataFiles) {
-            appendFiles.appendFile(dataFile);
-        }
-        appendFiles.commit();
-
-        succeeded = true;
-        LOG.info("Successfully logged watermark for db={} commit_id={} commit_start_time={}",
-            db, commitState.currentCommitId(), commitState.getStartTime());
-
+      }
     } catch (Throwable t) {
-        LOG.error("Failed to write watermark for db={} commit_id={}",
-            db, commitState.currentCommitId(), t);
-    } finally {
-        if (writer != null) {
-            try {
-                if (succeeded) {
-                    writer.close();
-                } else {
-                    writer.abort();
-                }
-            } catch (IOException e) {
-                LOG.warn("Failed to cleanup writer", e);
-            }
-        }
+      LOG.error("Failed to publish watermarks for commit {}", commitState.currentCommitId(), t);
     }
+  }
+
+  static Map<TableIdentifier, TopicPartition> mergeKnownAndActive(
+      Map<TableIdentifier, TopicPartition> known,
+      Map<TableIdentifier, Map<TopicPartition, io.tabular.iceberg.connect.events.TopicPartitionOffset>>
+          activeByTable) {
+    Map<TableIdentifier, TopicPartition> result = Maps.newHashMap(known);
+    activeByTable.forEach(
+        (tableId, perTp) -> {
+          if (!result.containsKey(tableId) && !perTp.isEmpty()) {
+            result.put(tableId, perTp.keySet().iterator().next());
+          }
+        });
+    return result;
+  }
+
+  private Map<TopicPartition, ListOffsetsResult.ListOffsetsResultInfo> listOffsets(
+      Set<TopicPartition> tps, OffsetSpec spec) throws Exception {
+    Map<TopicPartition, OffsetSpec> req = Maps.newHashMap();
+    tps.forEach(tp -> req.put(tp, spec));
+    return admin().listOffsets(req).all().get();
+  }
+
+  private Future<RecordMetadata> sendWatermarkRecord(
+      TableIdentifier tableId,
+      TopicPartition tp,
+      String commitId,
+      long commitTime,
+      Map<TopicPartition, io.tabular.iceberg.connect.events.TopicPartitionOffset> tableActive,
+      ListOffsetsResult.ListOffsetsResultInfo latest,
+      ListOffsetsResult.ListOffsetsResultInfo maxTs) {
+    String db = String.join(".", tableId.namespace().levels());
+    String table = tableId.name();
+
+    io.tabular.iceberg.connect.events.TopicPartitionOffset tpo = pickActiveOffset(tableActive, tp);
+    Long lastConsumedOffset = tpo == null ? null : tpo.offset();
+    Long lastConsumedEventTime = tpo == null ? null : tpo.timestamp();
+
+    Long lastKafkaOffset = computeLastKafkaOffset(latest, maxTs);
+    Long lastKafkaEventTime = computeLastKafkaEventTime(maxTs);
+
+    org.apache.avro.generic.GenericRecord record =
+        TableWatermark.build(
+            db,
+            table,
+            commitId,
+            commitTime,
+            tp.topic(),
+            lastConsumedOffset,
+            lastConsumedEventTime,
+            lastKafkaOffset,
+            lastKafkaEventTime);
+
+    String key = db + "." + table;
+    return watermarkProducer.send(new ProducerRecord<>(watermarkTopic, key, record));
+  }
+
+  // Treats the partition as "empty right now" when maxTimestamp returns -1 (KIP-734) — either
+  // never written to or retention deleted everything. In that case latest.offset() still reports
+  // the log-end-offset, but it points at a non-existent record, so we publish null for both
+  // fields. Downstream sees "Kafka has nothing here" rather than a phantom offset.
+  static Long computeLastKafkaOffset(
+      ListOffsetsResult.ListOffsetsResultInfo latest,
+      ListOffsetsResult.ListOffsetsResultInfo maxTs) {
+    if (maxTs == null || maxTs.timestamp() < 0) {
+      return null;
+    }
+    if (latest == null || latest.offset() <= 0) {
+      return null;
+    }
+    return latest.offset() - 1;
+  }
+
+  static Long computeLastKafkaEventTime(ListOffsetsResult.ListOffsetsResultInfo maxTs) {
+    if (maxTs == null || maxTs.timestamp() < 0) {
+      return null;
+    }
+    return maxTs.timestamp();
+  }
+
+  static io.tabular.iceberg.connect.events.TopicPartitionOffset pickActiveOffset(
+      Map<TopicPartition, io.tabular.iceberg.connect.events.TopicPartitionOffset> tableActive,
+      TopicPartition tp) {
+    if (tableActive == null || tableActive.isEmpty()) {
+      return null;
+    }
+    io.tabular.iceberg.connect.events.TopicPartitionOffset tpo = tableActive.get(tp);
+    return tpo != null ? tpo : tableActive.values().iterator().next();
+  }
+
+  static Map<
+          TableIdentifier, Map<TopicPartition, io.tabular.iceberg.connect.events.TopicPartitionOffset>>
+      collectActiveOffsets(List<Envelope> dataOffsetsSnapshot) {
+    Map<TableIdentifier, Map<TopicPartition, io.tabular.iceberg.connect.events.TopicPartitionOffset>>
+        result = Maps.newHashMap();
+    for (Envelope env : dataOffsetsSnapshot) {
+      DataOffsetsPayload payload = (DataOffsetsPayload) env.localEvent().payload();
+      TableIdentifier tableId = payload.tableName().toIdentifier();
+      Map<TopicPartition, io.tabular.iceberg.connect.events.TopicPartitionOffset> perTable =
+          result.computeIfAbsent(tableId, k -> Maps.newHashMap());
+      for (io.tabular.iceberg.connect.events.TopicPartitionOffset tpo : payload.dataOffsets()) {
+        TopicPartition tp = new TopicPartition(tpo.topic(), tpo.partition());
+        io.tabular.iceberg.connect.events.TopicPartitionOffset existing = perTable.get(tp);
+        // when several DATA_OFFSETS come for the same (table, tp) within a cycle, keep the one
+        // with the highest offset — that is the latest record we wrote
+        if (existing == null
+            || (tpo.offset() != null
+                && (existing.offset() == null || tpo.offset() > existing.offset()))) {
+          perTable.put(tp, tpo);
+        }
+      }
+    }
+    return result;
   }
 
   private Pair<Table, Optional<String>> getTableAndBranch(TableIdentifier tableIdentifier) {
@@ -700,5 +831,22 @@ public class Coordinator extends Channel implements AutoCloseable {
     }
 
     stop();
+  }
+
+  @Override
+  public void stop() {
+    if (watermarkProducer != null) {
+      try {
+        watermarkProducer.flush();
+      } catch (Exception e) {
+        LOG.warn("Error flushing watermark producer", e);
+      }
+      try {
+        watermarkProducer.close(Duration.ofSeconds(30));
+      } catch (Exception e) {
+        LOG.warn("Error closing watermark producer", e);
+      }
+    }
+    super.stop();
   }
 }

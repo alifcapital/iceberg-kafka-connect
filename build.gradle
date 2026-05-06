@@ -25,6 +25,9 @@ subprojects {
     maven {
       url = "https://tabular-repository-public.s3.amazonaws.com/releases"
     }
+    maven {
+      url = "https://packages.confluent.io/maven/"
+    }
   }
 
   sourceCompatibility = JavaVersion.VERSION_11
