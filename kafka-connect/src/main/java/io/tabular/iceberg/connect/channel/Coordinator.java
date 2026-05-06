@@ -258,19 +258,29 @@ public class Coordinator extends Channel implements AutoCloseable {
     for (TableIdentifier tableId : tables) {
       try {
         Table t = catalog.loadTable(tableId);
-        Snapshot snapshot = t.currentSnapshot();
-        // Snapshot belongs to THIS cycle only if its summary carries our current commit-id.
-        // If the per-table commit was skipped (no data/delete files after dedup), the table's
-        // currentSnapshot is the previous one and must not be recorded as ours.
-        if (snapshot != null
-            && currentCommitId.equals(snapshot.summary().get(COMMIT_ID_SNAPSHOT_PROP))) {
-          result.put(tableId, snapshot);
+        Snapshot found = findOurSnapshot(t, currentCommitId);
+        if (found != null) {
+          result.put(tableId, found);
         }
       } catch (Exception e) {
         LOG.warn("Failed to capture iceberg snapshot for {} (skipping in watermark)", tableId, e);
       }
     }
     return result;
+  }
+
+  // Find the snapshot that THIS commit cycle produced for the table by scanning all snapshots
+  // and matching by `kafka.connect.commit-id` in the snapshot summary. Iterating instead of
+  // taking currentSnapshot() so a concurrent writer that pushed a newer snapshot on top of ours
+  // doesn't make us lose our snapshot reference. Returns null if our snapshot was skipped (empty
+  // after dedup) or already expired.
+  private static Snapshot findOurSnapshot(Table table, String currentCommitId) {
+    for (Snapshot snapshot : table.snapshots()) {
+      if (currentCommitId.equals(snapshot.summary().get(COMMIT_ID_SNAPSHOT_PROP))) {
+        return snapshot;
+      }
+    }
+    return null;
   }
 
   void publishWatermarks(
