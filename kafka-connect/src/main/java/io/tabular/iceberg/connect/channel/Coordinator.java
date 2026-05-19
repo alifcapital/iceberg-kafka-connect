@@ -99,6 +99,7 @@ public class Coordinator extends Channel implements AutoCloseable {
   private final String watermarkTopic;
   private final Producer<String, Object> watermarkProducer;
   private final TableTopicResolver tableTopicResolver;
+  private final DdlEventPublisher ddlEventPublisher;
   private volatile boolean terminated;
 
   public Coordinator(
@@ -126,6 +127,13 @@ public class Coordinator extends Channel implements AutoCloseable {
     } else {
       this.watermarkProducer = null;
       this.tableTopicResolver = null;
+    }
+
+    if (config.ddlEventsTopic() != null) {
+      this.ddlEventPublisher = new DdlEventPublisher(config);
+      LOG.info("DDL event publishing enabled for topic '{}'", config.ddlEventsTopic());
+    } else {
+      this.ddlEventPublisher = null;
     }
 
     // initial poll with longer duration so the consumer will initialize...
@@ -240,9 +248,14 @@ public class Coordinator extends Channel implements AutoCloseable {
     send(event);
 
     if (!partialCommit) {
-      Map<TableIdentifier, Snapshot> committedSnapshots =
+      Map<TableIdentifier, TableInspection> inspections =
           captureCommittedSnapshots(commitMap.keySet());
-      publishWatermarks(dataOffsetsSnapshot, committedSnapshots);
+      publishWatermarks(dataOffsetsSnapshot, inspections);
+      if (ddlEventPublisher != null) {
+        Map<TableIdentifier, Table> tables = Maps.newHashMap();
+        inspections.forEach((id, ins) -> tables.put(id, ins.table()));
+        ddlEventPublisher.publish(tables);
+      }
     }
 
     LOG.info(
@@ -252,18 +265,16 @@ public class Coordinator extends Channel implements AutoCloseable {
         vtts);
   }
 
-  private Map<TableIdentifier, Snapshot> captureCommittedSnapshots(Set<TableIdentifier> tables) {
+  private Map<TableIdentifier, TableInspection> captureCommittedSnapshots(Set<TableIdentifier> tables) {
     String currentCommitId = commitState.currentCommitId().toString();
-    Map<TableIdentifier, Snapshot> result = Maps.newHashMap();
+    Map<TableIdentifier, TableInspection> result = Maps.newHashMap();
     for (TableIdentifier tableId : tables) {
       try {
         Table t = catalog.loadTable(tableId);
         Snapshot found = findOurSnapshot(t, currentCommitId);
-        if (found != null) {
-          result.put(tableId, found);
-        }
+        result.put(tableId, new TableInspection(t, found));
       } catch (Exception e) {
-        LOG.warn("Failed to capture iceberg snapshot for {} (skipping in watermark)", tableId, e);
+        LOG.warn("Failed to load iceberg table for {} (skipping in watermark/ddl)", tableId, e);
       }
     }
     return result;
@@ -284,7 +295,7 @@ public class Coordinator extends Channel implements AutoCloseable {
   }
 
   void publishWatermarks(
-      List<Envelope> dataOffsetsSnapshot, Map<TableIdentifier, Snapshot> committedSnapshots) {
+      List<Envelope> dataOffsetsSnapshot, Map<TableIdentifier, TableInspection> committedInspections) {
     if (terminated
         || watermarkProducer == null
         || watermarkTopic == null
@@ -322,7 +333,7 @@ public class Coordinator extends Channel implements AutoCloseable {
                 activeByTable.get(entry.getKey()),
                 latestResult.get(entry.getValue()),
                 maxTsResult.get(entry.getValue()),
-                committedSnapshots.get(entry.getKey())));
+                snapshotFrom(committedInspections, entry.getKey())));
       }
       // wait for the broker to ack every send so silent serializer / SR / broker failures
       // surface here instead of being lost in the producer's internal callback queue
@@ -341,6 +352,12 @@ public class Coordinator extends Channel implements AutoCloseable {
     } catch (Throwable t) {
       LOG.error("Failed to publish watermarks for commit {}", commitState.currentCommitId(), t);
     }
+  }
+
+  private static Snapshot snapshotFrom(
+      Map<TableIdentifier, TableInspection> inspections, TableIdentifier tableId) {
+    TableInspection ins = inspections.get(tableId);
+    return ins == null ? null : ins.snapshotOrNull();
   }
 
   static Map<TableIdentifier, TopicPartition> mergeKnownAndActive(
@@ -886,6 +903,13 @@ public class Coordinator extends Channel implements AutoCloseable {
         watermarkProducer.close(Duration.ofSeconds(30));
       } catch (Exception e) {
         LOG.warn("Error closing watermark producer", e);
+      }
+    }
+    if (ddlEventPublisher != null) {
+      try {
+        ddlEventPublisher.close();
+      } catch (Exception e) {
+        LOG.warn("Error closing DDL event publisher", e);
       }
     }
     super.stop();

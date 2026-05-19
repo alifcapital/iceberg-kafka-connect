@@ -91,6 +91,7 @@ public class IcebergSinkConfig extends AbstractConfig {
   private static final String CONTROL_TOPIC_PROP = "iceberg.control.topic";
   private static final String CONTROL_GROUP_ID_PROP = "iceberg.control.group-id";
   private static final String WATERMARK_TOPIC_PROP = "iceberg.watermark.topic";
+  private static final String DDL_EVENTS_TOPIC_PROP = "iceberg.ddl-events.topic";
   private static final String CONNECT_TOPICS_PROP = "topics";
   private static final String CONNECT_TOPICS_REGEX_PROP = "topics.regex";
   private static final String CONNECT_TRANSFORMS_PROP = "transforms";
@@ -227,6 +228,13 @@ public class IcebergSinkConfig extends AbstractConfig {
         Importance.MEDIUM,
         "Name of the Kafka topic to publish per-table watermark messages to. "
             + "If unset, watermark publishing is disabled.");
+    configDef.define(
+        DDL_EVENTS_TOPIC_PROP,
+        Type.STRING,
+        null,
+        Importance.MEDIUM,
+        "Name of the Kafka topic to publish per-table DDL events (TABLE_CREATED, "
+            + "SCHEMA_CHANGED) to. If unset, DDL event publishing is disabled.");
     configDef.define(
         CONTROL_GROUP_ID_PROP,
         Type.STRING,
@@ -434,6 +442,10 @@ public class IcebergSinkConfig extends AbstractConfig {
 
   public String watermarkTopic() {
     return getString(WATERMARK_TOPIC_PROP);
+  }
+
+  public String ddlEventsTopic() {
+    return getString(DDL_EVENTS_TOPIC_PROP);
   }
 
   public Optional<Pattern> topicsRegex() {
