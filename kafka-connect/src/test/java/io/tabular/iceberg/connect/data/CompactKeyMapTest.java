@@ -27,6 +27,7 @@ import org.apache.iceberg.data.Record;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.types.Types;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 
 /** Correctness tests for CompactKeyMap implementations. */
 public class CompactKeyMapTest {
@@ -417,5 +418,164 @@ public class CompactKeyMapTest {
     // Should return null - key doesn't exist
     assertThat(map.remove(nonUuidKey)).isNull();
     assertThat(map.size()).isEqualTo(1);
+  }
+
+  // ---------------------------------------------------------------------------------------
+  // Regression: insert/delete churn must not deadlock lookups.
+  //
+  // Queue-like tables (a row is inserted and deleted seconds later) keep the number of live
+  // entries near zero while leaving one tombstone behind per pair. While resize() was gated
+  // on live entries alone it never ran, tombstones were never reclaimed, and once no empty
+  // slot was left a lookup for an absent key looped forever. That spin is uninterruptible:
+  // the sink task could neither make progress nor be stopped, and every restart leaked
+  // another running task thread.
+  // ---------------------------------------------------------------------------------------
+
+  private static final int CHURN = 20_000;
+  private static final String PATH = "/path/file.parquet";
+
+  private static Record longKey(long id) {
+    Record key = GenericRecord.create(LONG_KEY_SCHEMA);
+    key.setField("id", id);
+    return key;
+  }
+
+  private static Record stringKey(String id) {
+    Record key = GenericRecord.create(STRING_KEY_SCHEMA);
+    key.setField("id", id);
+    return key;
+  }
+
+  private static Record decimalKey(long unscaled) {
+    Record key = GenericRecord.create(DECIMAL_KEY_SCHEMA);
+    key.setField("id", BigDecimal.valueOf(unscaled, 2));
+    return key;
+  }
+
+  private static Record multiKey(long id1, String id2) {
+    Record key = GenericRecord.create(MULTI_KEY_SCHEMA);
+    key.setField("id1", id1);
+    key.setField("id2", id2);
+    return key;
+  }
+
+  @Test
+  @Timeout(value = 30, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+  public void testLongKeyRemoveTerminatesAfterChurn() {
+    CompactKeyMap map = CompactKeyMap.create(LONG_KEY_SCHEMA);
+
+    for (int i = 0; i < CHURN; i++) {
+      map.put(longKey(i), PATH, i);
+      map.remove(longKey(i));
+    }
+
+    assertThat(map.size()).isZero();
+    assertThat(map.remove(longKey(-1))).isNull(); // used to spin forever
+  }
+
+  @Test
+  @Timeout(value = 30, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+  public void testUuidKeyRemoveTerminatesAfterChurn() {
+    CompactKeyMap map = CompactKeyMap.create(STRING_KEY_SCHEMA);
+
+    for (int i = 0; i < CHURN; i++) {
+      Record key = stringKey(String.format("550e8400-e29b-41d4-a716-%012x", i));
+      map.put(key, PATH, i);
+      map.remove(key);
+    }
+
+    assertThat(map.size()).isZero();
+    assertThat(map.remove(stringKey("550e8400-e29b-41d4-a716-ffffffffffff"))).isNull();
+  }
+
+  @Test
+  @Timeout(value = 30, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+  public void testStringKeyRemoveTerminatesAfterChurn() {
+    CompactKeyMap map = CompactKeyMap.create(STRING_KEY_SCHEMA);
+
+    for (int i = 0; i < CHURN; i++) {
+      Record key = stringKey("key-" + i);
+      map.put(key, PATH, i);
+      map.remove(key);
+    }
+
+    assertThat(map.size()).isZero();
+    assertThat(map.remove(stringKey("key-absent"))).isNull();
+  }
+
+  @Test
+  @Timeout(value = 30, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+  public void testDecimalKeyRemoveTerminatesAfterChurn() {
+    CompactKeyMap map = CompactKeyMap.create(DECIMAL_KEY_SCHEMA);
+
+    for (int i = 0; i < CHURN; i++) {
+      map.put(decimalKey(i), PATH, i);
+      map.remove(decimalKey(i));
+    }
+
+    assertThat(map.size()).isZero();
+    assertThat(map.remove(decimalKey(-1))).isNull();
+  }
+
+  @Test
+  @Timeout(value = 30, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+  public void testMultiColumnKeyRemoveTerminatesAfterChurn() {
+    CompactKeyMap map = CompactKeyMap.create(MULTI_KEY_SCHEMA);
+
+    for (int i = 0; i < CHURN; i++) {
+      map.put(multiKey(i, "k" + i), PATH, i);
+      map.remove(multiKey(i, "k" + i));
+    }
+
+    assertThat(map.size()).isZero();
+    assertThat(map.remove(multiKey(-1, "absent"))).isNull();
+  }
+
+  /** Churn must not make the map grow: only live entries justify a bigger table. */
+  @Test
+  @Timeout(value = 30, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+  public void testChurnDoesNotGrowTheMap() {
+    CompactKeyMap map = CompactKeyMap.create(LONG_KEY_SCHEMA);
+
+    for (int i = 0; i < CHURN; i++) {
+      map.put(longKey(i), PATH, i);
+      map.remove(longKey(i));
+      assertThat(map.size()).isZero();
+    }
+  }
+
+  /**
+   * Re-inserting a key that is still live must update it in place. Inserting into the first
+   * tombstone of the probe chain without checking the rest of it leaves two entries for the
+   * same key, and the stale one later produces a position delete against the wrong row.
+   */
+  @Test
+  @Timeout(value = 30, threadMode = Timeout.ThreadMode.SEPARATE_THREAD)
+  public void testNoDuplicateEntriesWhenTombstonePrecedesLiveKey() {
+    CompactKeyMap map = CompactKeyMap.create(LONG_KEY_SCHEMA);
+    int n = 5_000;
+
+    for (int i = 0; i < n; i++) {
+      map.put(longKey(i), PATH, i);
+    }
+    // Remove every second key, scattering tombstones through the probe chains.
+    for (int i = 0; i < n; i += 2) {
+      map.remove(longKey(i));
+    }
+    assertThat(map.size()).isEqualTo(n / 2);
+
+    // Re-insert the keys that are still live: each must be found and updated, not duplicated.
+    for (int i = 1; i < n; i += 2) {
+      assertThat(map.put(longKey(i), PATH, i + 1_000_000)).isNotNull();
+    }
+    assertThat(map.size()).isEqualTo(n / 2);
+
+    for (int i = 1; i < n; i += 2) {
+      assertThat(map.remove(longKey(i))).isNotNull();
+    }
+    assertThat(map.size()).isZero();
+    for (int i = 1; i < n; i += 2) {
+      assertThat(map.remove(longKey(i))).isNull(); // no stale duplicate left behind
+    }
   }
 }

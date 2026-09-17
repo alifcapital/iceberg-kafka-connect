@@ -216,7 +216,8 @@ public abstract class CompactKeyMap {
 
     private long[] keys;
     private long[] values; // packed (pathIndex << 32) | position
-    private int size;
+    private int size; // live entries
+    private int occupied; // live entries + tombstones == all non-empty slots
     private int threshold;
 
     LongKeyMap(Schema deleteSchema) {
@@ -244,22 +245,39 @@ public abstract class CompactKeyMap {
     }
 
     private PathOffset putInternal(long k, int pathIndex, int position) {
-      if (size >= threshold) {
+      // Resize on occupied slots, not on live entries: tombstones take up slots too, and
+      // resize() is the only place that reclaims them. Gating on size alone means an
+      // insert/delete workload (queue tables) never resizes and never reclaims, until no
+      // empty slot is left and lookups for absent keys spin forever.
+      if (occupied >= threshold) {
         resize();
       }
 
       int mask = keys.length - 1;
       int idx = hash(k) & mask;
+      int firstTombstone = -1;
 
       while (true) {
         long existing = keys[idx];
-        if (existing == EMPTY_KEY || existing == TOMBSTONE) {
-          keys[idx] = k;
-          values[idx] = pack(pathIndex, position);
+        if (existing == EMPTY_KEY) {
+          // End of the probe chain: the key is not present. Prefer a tombstone seen earlier.
+          if (firstTombstone >= 0) {
+            keys[firstTombstone] = k;
+            values[firstTombstone] = pack(pathIndex, position);
+          } else {
+            keys[idx] = k;
+            values[idx] = pack(pathIndex, position);
+            occupied++;
+          }
           size++;
           return null;
         }
-        if (existing == k) {
+        if (existing == TOMBSTONE) {
+          // Remember it, but keep probing: the key may live further down the chain.
+          if (firstTombstone < 0) {
+            firstTombstone = idx;
+          }
+        } else if (existing == k) {
           PathOffset old = unpack(values[idx]);
           values[idx] = pack(pathIndex, position);
           return old;
@@ -283,19 +301,23 @@ public abstract class CompactKeyMap {
       int mask = keys.length - 1;
       int idx = hash(k) & mask;
 
-      while (true) {
+      // Bounded probing: a full pass means the key is absent. Belt and braces on top of the
+      // occupied-based resize, so a future regression degrades to a slow lookup instead of
+      // an uninterruptible spin that no task restart can clear.
+      for (int probes = 0; probes < keys.length; probes++) {
         long existing = keys[idx];
         if (existing == EMPTY_KEY) {
           return null;
         }
         if (existing == k) {
           PathOffset old = unpack(values[idx]);
-          keys[idx] = TOMBSTONE;
+          keys[idx] = TOMBSTONE; // slot stays occupied, so occupied is left untouched
           size--;
           return old;
         }
         idx = (idx + 1) & mask;
       }
+      return null;
     }
 
     private int hash(long k) {
@@ -305,7 +327,9 @@ public abstract class CompactKeyMap {
     }
 
     private void resize() {
-      int newCapacity = keys.length * 2;
+      // Tombstones alone must not grow the map: when the live entries still fit comfortably,
+      // rehash at the same capacity and simply drop the tombstones.
+      int newCapacity = size >= threshold / 2 ? keys.length * 2 : keys.length;
       long[] oldKeys = keys;
       long[] oldValues = values;
 
@@ -314,6 +338,7 @@ public abstract class CompactKeyMap {
       Arrays.fill(keys, EMPTY_KEY);
       threshold = (int) (newCapacity * LOAD_FACTOR);
       size = 0;
+      occupied = 0; // tombstones are dropped here; putInternal rebuilds both counters
 
       for (int i = 0; i < oldKeys.length; i++) {
         long k = oldKeys[i];
@@ -338,6 +363,7 @@ public abstract class CompactKeyMap {
       if (keys != null) {
         Arrays.fill(keys, EMPTY_KEY);
         size = 0;
+        occupied = 0;
       }
       paths.clear();
       pathToIndex.clear();
@@ -374,6 +400,7 @@ public abstract class CompactKeyMap {
       keys = null;
       values = null;
       size = 0;
+      occupied = 0;
       threshold = 0;
     }
   }
@@ -442,7 +469,8 @@ public abstract class CompactKeyMap {
     private long[] highBits;
     private long[] lowBits;
     private long[] values;
-    private int size;
+    private int size; // live entries
+    private int occupied; // live entries + tombstones == all non-empty slots
     private int threshold;
     private StringKeyMap fallback;
 
@@ -469,23 +497,36 @@ public abstract class CompactKeyMap {
     }
 
     private PathOffset putInternal(long high, long low, int pathIndex, int position) {
-      if (size >= threshold) {
+      // See LongKeyMap.putInternal: the threshold must count occupied slots, not live entries.
+      if (occupied >= threshold) {
         resize();
       }
 
       int mask = highBits.length - 1;
       int idx = hash(high, low) & mask;
+      int firstTombstone = -1;
 
       while (true) {
         long existingHigh = highBits[idx];
-        if (existingHigh == EMPTY || existingHigh == TOMBSTONE_MARKER) {
-          highBits[idx] = high;
-          lowBits[idx] = low;
-          values[idx] = pack(pathIndex, position);
+        if (existingHigh == EMPTY) {
+          if (firstTombstone >= 0) {
+            highBits[firstTombstone] = high;
+            lowBits[firstTombstone] = low;
+            values[firstTombstone] = pack(pathIndex, position);
+          } else {
+            highBits[idx] = high;
+            lowBits[idx] = low;
+            values[idx] = pack(pathIndex, position);
+            occupied++;
+          }
           size++;
           return null;
         }
-        if (existingHigh == high && lowBits[idx] == low) {
+        if (existingHigh == TOMBSTONE_MARKER) {
+          if (firstTombstone < 0) {
+            firstTombstone = idx;
+          }
+        } else if (existingHigh == high && lowBits[idx] == low) {
           PathOffset old = unpack(values[idx]);
           values[idx] = pack(pathIndex, position);
           return old;
@@ -509,19 +550,20 @@ public abstract class CompactKeyMap {
       int mask = highBits.length - 1;
       int idx = hash(high, low) & mask;
 
-      while (true) {
+      for (int probes = 0; probes < highBits.length; probes++) {
         long existingHigh = highBits[idx];
         if (existingHigh == EMPTY) {
           return null;
         }
         if (existingHigh == high && lowBits[idx] == low) {
           PathOffset old = unpack(values[idx]);
-          highBits[idx] = TOMBSTONE_MARKER;
+          highBits[idx] = TOMBSTONE_MARKER; // slot stays occupied
           size--;
           return old;
         }
         idx = (idx + 1) & mask;
       }
+      return null;
     }
 
     private int hash(long high, long low) {
@@ -531,7 +573,8 @@ public abstract class CompactKeyMap {
     }
 
     private void resize() {
-      int newCapacity = highBits.length * 2;
+      // Tombstones alone must not grow the map: see LongKeyMap.resize.
+      int newCapacity = size >= threshold / 2 ? highBits.length * 2 : highBits.length;
       long[] oldHigh = highBits;
       long[] oldLow = lowBits;
       long[] oldValues = values;
@@ -542,6 +585,7 @@ public abstract class CompactKeyMap {
       Arrays.fill(highBits, EMPTY);
       threshold = (int) (newCapacity * LOAD_FACTOR);
       size = 0;
+      occupied = 0;
 
       for (int i = 0; i < oldHigh.length; i++) {
         long high = oldHigh[i];
@@ -574,6 +618,7 @@ public abstract class CompactKeyMap {
       lowBits = null;
       values = null;
       size = 0;
+      occupied = 0;
     }
 
     private static String formatUuid(long high, long low) {
@@ -601,6 +646,7 @@ public abstract class CompactKeyMap {
         Arrays.fill(highBits, EMPTY);
       }
       size = 0;
+      occupied = 0;
       paths.clear();
       pathToIndex.clear();
     }
@@ -620,7 +666,8 @@ public abstract class CompactKeyMap {
 
     private String[] keys;
     private long[] values;
-    private int size;
+    private int size; // live entries
+    private int occupied; // live entries + tombstones == all non-empty slots
     private int threshold;
 
     StringKeyMap() {
@@ -636,22 +683,34 @@ public abstract class CompactKeyMap {
     }
 
     private PathOffset putInternal(String k, int pathIndex, int position) {
-      if (size >= threshold) {
+      // See LongKeyMap.putInternal: the threshold must count occupied slots, not live entries.
+      if (occupied >= threshold) {
         resize();
       }
 
       int mask = keys.length - 1;
       int idx = hash(k) & mask;
+      int firstTombstone = -1;
 
       while (true) {
         String existing = keys[idx];
-        if (existing == null || existing == TOMBSTONE) {
-          keys[idx] = k;
-          values[idx] = pack(pathIndex, position);
+        if (existing == null) {
+          if (firstTombstone >= 0) {
+            keys[firstTombstone] = k;
+            values[firstTombstone] = pack(pathIndex, position);
+          } else {
+            keys[idx] = k;
+            values[idx] = pack(pathIndex, position);
+            occupied++;
+          }
           size++;
           return null;
         }
-        if (existing.equals(k)) {
+        if (existing == TOMBSTONE) {
+          if (firstTombstone < 0) {
+            firstTombstone = idx;
+          }
+        } else if (existing.equals(k)) {
           PathOffset old = unpack(values[idx]);
           values[idx] = pack(pathIndex, position);
           return old;
@@ -667,19 +726,20 @@ public abstract class CompactKeyMap {
       int mask = keys.length - 1;
       int idx = hash(k) & mask;
 
-      while (true) {
+      for (int probes = 0; probes < keys.length; probes++) {
         String existing = keys[idx];
         if (existing == null) {
           return null;
         }
         if (existing != TOMBSTONE && existing.equals(k)) {
           PathOffset old = unpack(values[idx]);
-          keys[idx] = TOMBSTONE;
+          keys[idx] = TOMBSTONE; // slot stays occupied
           size--;
           return old;
         }
         idx = (idx + 1) & mask;
       }
+      return null;
     }
 
     private int hash(String k) {
@@ -687,7 +747,8 @@ public abstract class CompactKeyMap {
     }
 
     private void resize() {
-      int newCapacity = keys.length * 2;
+      // Tombstones alone must not grow the map: see LongKeyMap.resize.
+      int newCapacity = size >= threshold / 2 ? keys.length * 2 : keys.length;
       String[] oldKeys = keys;
       long[] oldValues = values;
 
@@ -695,6 +756,7 @@ public abstract class CompactKeyMap {
       values = new long[newCapacity];
       threshold = (int) (newCapacity * LOAD_FACTOR);
       size = 0;
+      occupied = 0;
 
       for (int i = 0; i < oldKeys.length; i++) {
         String k = oldKeys[i];
@@ -714,6 +776,7 @@ public abstract class CompactKeyMap {
     public void clear() {
       Arrays.fill(keys, null);
       size = 0;
+      occupied = 0;
       paths.clear();
       pathToIndex.clear();
     }
@@ -728,7 +791,8 @@ public abstract class CompactKeyMap {
 
     private BigDecimal[] keys;
     private long[] values;
-    private int size;
+    private int size; // live entries
+    private int occupied; // live entries + tombstones == all non-empty slots
     private int threshold;
 
     DecimalKeyMap() {
@@ -744,22 +808,34 @@ public abstract class CompactKeyMap {
     }
 
     private PathOffset putInternal(BigDecimal k, int pathIndex, int position) {
-      if (size >= threshold) {
+      // See LongKeyMap.putInternal: the threshold must count occupied slots, not live entries.
+      if (occupied >= threshold) {
         resize();
       }
 
       int mask = keys.length - 1;
       int idx = hash(k) & mask;
+      int firstTombstone = -1;
 
       while (true) {
         BigDecimal existing = keys[idx];
-        if (existing == null || existing == TOMBSTONE) {
-          keys[idx] = k;
-          values[idx] = pack(pathIndex, position);
+        if (existing == null) {
+          if (firstTombstone >= 0) {
+            keys[firstTombstone] = k;
+            values[firstTombstone] = pack(pathIndex, position);
+          } else {
+            keys[idx] = k;
+            values[idx] = pack(pathIndex, position);
+            occupied++;
+          }
           size++;
           return null;
         }
-        if (existing.equals(k)) {
+        if (existing == TOMBSTONE) {
+          if (firstTombstone < 0) {
+            firstTombstone = idx;
+          }
+        } else if (existing.equals(k)) {
           PathOffset old = unpack(values[idx]);
           values[idx] = pack(pathIndex, position);
           return old;
@@ -775,19 +851,20 @@ public abstract class CompactKeyMap {
       int mask = keys.length - 1;
       int idx = hash(k) & mask;
 
-      while (true) {
+      for (int probes = 0; probes < keys.length; probes++) {
         BigDecimal existing = keys[idx];
         if (existing == null) {
           return null;
         }
         if (existing != TOMBSTONE && existing.equals(k)) {
           PathOffset old = unpack(values[idx]);
-          keys[idx] = TOMBSTONE;
+          keys[idx] = TOMBSTONE; // slot stays occupied
           size--;
           return old;
         }
         idx = (idx + 1) & mask;
       }
+      return null;
     }
 
     private int hash(BigDecimal k) {
@@ -795,7 +872,8 @@ public abstract class CompactKeyMap {
     }
 
     private void resize() {
-      int newCapacity = keys.length * 2;
+      // Tombstones alone must not grow the map: see LongKeyMap.resize.
+      int newCapacity = size >= threshold / 2 ? keys.length * 2 : keys.length;
       BigDecimal[] oldKeys = keys;
       long[] oldValues = values;
 
@@ -803,6 +881,7 @@ public abstract class CompactKeyMap {
       values = new long[newCapacity];
       threshold = (int) (newCapacity * LOAD_FACTOR);
       size = 0;
+      occupied = 0;
 
       for (int i = 0; i < oldKeys.length; i++) {
         BigDecimal k = oldKeys[i];
@@ -822,6 +901,7 @@ public abstract class CompactKeyMap {
     public void clear() {
       Arrays.fill(keys, null);
       size = 0;
+      occupied = 0;
       paths.clear();
       pathToIndex.clear();
     }
@@ -858,7 +938,8 @@ public abstract class CompactKeyMap {
 
     private CompactKey[] keys;
     private long[] values;
-    private int size;
+    private int size; // live entries
+    private int occupied; // live entries + tombstones == all non-empty slots
     private int threshold;
     private final int columnCount;
 
@@ -876,22 +957,34 @@ public abstract class CompactKeyMap {
     }
 
     private PathOffset putInternal(CompactKey k, int pathIndex, int position) {
-      if (size >= threshold) {
+      // See LongKeyMap.putInternal: the threshold must count occupied slots, not live entries.
+      if (occupied >= threshold) {
         resize();
       }
 
       int mask = keys.length - 1;
       int idx = k.hash & mask;
+      int firstTombstone = -1;
 
       while (true) {
         CompactKey existing = keys[idx];
-        if (existing == null || existing == TOMBSTONE) {
-          keys[idx] = k;
-          values[idx] = pack(pathIndex, position);
+        if (existing == null) {
+          if (firstTombstone >= 0) {
+            keys[firstTombstone] = k;
+            values[firstTombstone] = pack(pathIndex, position);
+          } else {
+            keys[idx] = k;
+            values[idx] = pack(pathIndex, position);
+            occupied++;
+          }
           size++;
           return null;
         }
-        if (existing.equals(k)) {
+        if (existing == TOMBSTONE) {
+          if (firstTombstone < 0) {
+            firstTombstone = idx;
+          }
+        } else if (existing.equals(k)) {
           PathOffset old = unpack(values[idx]);
           values[idx] = pack(pathIndex, position);
           return old;
@@ -907,19 +1000,20 @@ public abstract class CompactKeyMap {
       int mask = keys.length - 1;
       int idx = k.hash & mask;
 
-      while (true) {
+      for (int probes = 0; probes < keys.length; probes++) {
         CompactKey existing = keys[idx];
         if (existing == null) {
           return null;
         }
         if (existing != TOMBSTONE && existing.equals(k)) {
           PathOffset old = unpack(values[idx]);
-          keys[idx] = TOMBSTONE;
+          keys[idx] = TOMBSTONE; // slot stays occupied
           size--;
           return old;
         }
         idx = (idx + 1) & mask;
       }
+      return null;
     }
 
     private CompactKey extractKey(Record key) {
@@ -950,7 +1044,8 @@ public abstract class CompactKeyMap {
     }
 
     private void resize() {
-      int newCapacity = keys.length * 2;
+      // Tombstones alone must not grow the map: see LongKeyMap.resize.
+      int newCapacity = size >= threshold / 2 ? keys.length * 2 : keys.length;
       CompactKey[] oldKeys = keys;
       long[] oldValues = values;
 
@@ -958,6 +1053,7 @@ public abstract class CompactKeyMap {
       values = new long[newCapacity];
       threshold = (int) (newCapacity * LOAD_FACTOR);
       size = 0;
+      occupied = 0;
 
       for (int i = 0; i < oldKeys.length; i++) {
         CompactKey k = oldKeys[i];
@@ -977,6 +1073,7 @@ public abstract class CompactKeyMap {
     public void clear() {
       Arrays.fill(keys, null);
       size = 0;
+      occupied = 0;
       paths.clear();
       pathToIndex.clear();
     }
