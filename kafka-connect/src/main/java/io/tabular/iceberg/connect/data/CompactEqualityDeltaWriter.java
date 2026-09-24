@@ -21,6 +21,7 @@ package io.tabular.iceberg.connect.data;
 import java.io.Closeable;
 import java.io.IOException;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DeleteFile;
@@ -49,6 +50,7 @@ import org.apache.iceberg.util.CharSequenceSet;
  * rows.
  *
  * <p>This writer replaces BaseEqualityDeltaWriter with a more memory-efficient implementation:
+ *
  * <ul>
  *   <li>Uses primitive arrays for single-column INT/LONG keys (~20 bytes vs ~120 bytes per entry)
  *   <li>Uses optimized hash maps for STRING/DECIMAL keys
@@ -70,9 +72,31 @@ public class CompactEqualityDeltaWriter implements Closeable {
   private final RecordProjection keyProjection;
 
   // Compact key-to-position map instead of StructLikeMap
-  private final CompactKeyMap insertedRowMap;
+  private CompactKeyMap insertedRowMap;
+  private boolean sharedPendingKeys;
 
-  // If true, deduplicate inserts in buffer. If false, track all positions for tables without real PK.
+  void usePendingKeys(Map<List<Object>, CompactKeyMap> pendingKeys) {
+    if (sharedPendingKeys) {
+      return;
+    }
+    List<Object> partitionId = Lists.newArrayList();
+    partitionId.add(spec.specId());
+    if (partition != null) {
+      for (int i = 0; i < partition.size(); i++) {
+        Object value = partition.get(i, Object.class);
+        partitionId.add(value instanceof Integer ? ((Integer) value).longValue() : value);
+      }
+    }
+    CompactKeyMap previous = pendingKeys.putIfAbsent(partitionId, insertedRowMap);
+    if (previous != null) {
+      insertedRowMap = previous;
+      insertedRowMap.updateSchema(deleteSchema);
+    }
+    sharedPendingKeys = true;
+  }
+
+  // If true, deduplicate inserts in buffer. If false, track all positions for tables without real
+  // PK.
   private final boolean deduplicateInserts;
 
   // Writers
@@ -256,8 +280,10 @@ public class CompactEqualityDeltaWriter implements Closeable {
         posDeleteWriter = null;
       }
 
-      // Clear the map
-      insertedRowMap.clear();
+      // Schema rotations share pending positions until the entire commit window completes.
+      if (!sharedPendingKeys) {
+        insertedRowMap.clear();
+      }
 
     } finally {
       closed = true;

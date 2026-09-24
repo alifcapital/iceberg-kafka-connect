@@ -19,11 +19,12 @@
 package io.tabular.iceberg.connect.data;
 
 import java.io.IOException;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
-import org.apache.iceberg.StructLike;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.io.FileAppenderFactory;
 import org.apache.iceberg.io.FileIO;
@@ -117,9 +118,13 @@ public abstract class CompactDeltaTaskWriter implements TaskWriter<Record> {
     return hasRealPk;
   }
 
-  /**
-   * Route record to appropriate partition writer.
-   */
+  /** Route record to appropriate partition writer. */
+  private Map<List<Object>, CompactKeyMap> pendingKeys;
+
+  void usePendingKeys(Map<List<Object>, CompactKeyMap> keys) {
+    this.pendingKeys = keys;
+  }
+
   protected abstract CompactEqualityDeltaWriter route(Record row);
 
   /**
@@ -144,6 +149,9 @@ public abstract class CompactDeltaTaskWriter implements TaskWriter<Record> {
     }
 
     CompactEqualityDeltaWriter writer = route(row);
+    if (pendingKeys != null) {
+      writer.usePendingKeys(pendingKeys);
+    }
 
     switch (op) {
       case DELETE:

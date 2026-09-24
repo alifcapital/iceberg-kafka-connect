@@ -23,8 +23,11 @@ import io.tabular.iceberg.connect.data.SchemaUpdate.Consumer;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.data.Record;
@@ -32,7 +35,11 @@ import org.apache.iceberg.io.TaskWriter;
 import org.apache.iceberg.io.WriteResult;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.iceberg.types.Type;
+import org.apache.iceberg.types.TypeUtil;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.connect.data.Field;
+import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.errors.DataException;
 import org.apache.kafka.connect.sink.SinkRecord;
@@ -50,10 +57,16 @@ public class IcebergWriter implements RecordWriter {
   private final List<WriterResult> writerResults;
   private final Map<TopicPartition, Offset> dataOffsets;
 
+  // Bounded cache scoped to the current table schema and this writer's immutable config.
+  private final Map<Schema, Boolean> validatedSchemas = new LinkedHashMap<>();
+  private Schema validatedKeySchema;
+  private int validatedTableSchemaId = -1;
+  private final Map<List<Object>, CompactKeyMap> pendingKeys = Maps.newHashMap();
   private RecordConverter recordConverter;
   private TaskWriter<Record> writer;
 
-  public IcebergWriter(Table table, String tableName, IcebergSinkConfig config, boolean hasReliablePk) {
+  public IcebergWriter(
+      Table table, String tableName, IcebergSinkConfig config, boolean hasReliablePk) {
     this.table = table;
     this.tableName = tableName;
     this.config = config;
@@ -64,7 +77,13 @@ public class IcebergWriter implements RecordWriter {
   }
 
   private void initNewWriter() {
+    validatedSchemas.clear();
+    validatedKeySchema = null;
+    validatedTableSchemaId = table.schema().schemaId();
     this.writer = Utilities.createTableWriter(table, tableName, config);
+    if (writer instanceof CompactDeltaTaskWriter) {
+      ((CompactDeltaTaskWriter) writer).usePendingKeys(pendingKeys);
+    }
     // In append mode without reliable PK, write _before_image as _cdc_before_image to Iceberg
     boolean writeBeforeImageToIceberg = config.tablesCdcField() == null && !hasReliablePk;
     this.recordConverter = new RecordConverter(table, config, writeBeforeImageToIceberg);
@@ -108,6 +127,40 @@ public class IcebergWriter implements RecordWriter {
   }
 
   private Record convertToRow(SinkRecord record) {
+    // Table metadata can also be refreshed by another owner of the Table instance.
+    if (validatedTableSchemaId != table.schema().schemaId()) {
+      flush();
+      initNewWriter();
+    }
+    validateKey(record.keySchema());
+    if (record.valueSchema() != null) {
+      if (!validatedSchemas.containsKey(record.valueSchema())) {
+        boolean cdcWithoutKey =
+            !config.tableConfig(tableName).appendOnly()
+                && (config.tablesCdcField() != null || config.upsertModeEnabled())
+                && table.schema().identifierFieldIds().isEmpty();
+        SchemaUpdate.Consumer planned =
+            recordConverter.planSchema(record.valueSchema(), cdcWithoutKey);
+        if (!planned.empty()) {
+          if (!config.evolveSchemaEnabled()) {
+            throw new DataException("Schema evolution is disabled for table " + tableName);
+          }
+          flush();
+          SchemaUtils.applySchemaUpdates(table, planned);
+          initNewWriter();
+          // Recheck refreshed metadata, including changes committed by other writers.
+          if (!recordConverter.planSchema(record.valueSchema(), cdcWithoutKey).empty()) {
+            throw new DataException(
+                "Table schema changed concurrently; retry record for " + tableName);
+          }
+        }
+        if (validatedSchemas.size() >= 64) {
+          validatedSchemas.clear();
+        }
+        validatedSchemas.put(record.valueSchema(), Boolean.TRUE);
+      }
+      return recordConverter.convert(record.value());
+    }
     if (!config.evolveSchemaEnabled()) {
       return recordConverter.convert(record.value());
     }
@@ -128,6 +181,52 @@ public class IcebergWriter implements RecordWriter {
     }
 
     return row;
+  }
+
+  private void validateKey(Schema keySchema) {
+    if (table.schema().identifierFieldIds().isEmpty()
+        || !config.tableConfig(tableName).idColumns().isEmpty()) {
+      return;
+    }
+    if (keySchema == null || keySchema.type() != Schema.Type.STRUCT) {
+      throw new DataException("Missing structured Kafka key for identifier fields of " + tableName);
+    }
+    if (keySchema.equals(validatedKeySchema)) {
+      return;
+    }
+    Set<String> names = keySchema.fields().stream().map(f -> f.name()).collect(Collectors.toSet());
+    if (!names.equals(table.schema().identifierFieldNames())) {
+      throw new DataException(
+          "Kafka key fields changed for "
+              + tableName
+              + ": expected "
+              + table.schema().identifierFieldNames()
+              + ", received "
+              + names);
+    }
+    for (Field field : keySchema.fields()) {
+      if (field.schema().isOptional()) {
+        throw new DataException("Nullable Kafka key field: " + field.name());
+      }
+      Type incoming = SchemaUtils.toIcebergType(field.schema(), config);
+      Type current = table.schema().findType(field.name());
+      if (!compatibleKeyTypes(incoming, current)) {
+        throw new DataException(
+            "Incompatible Kafka key type at "
+                + field.name()
+                + ": incoming "
+                + incoming
+                + ", Iceberg "
+                + current);
+      }
+    }
+    validatedKeySchema = keySchema;
+  }
+
+  private static boolean compatibleKeyTypes(Type incoming, Type current) {
+    return incoming.isPrimitiveType() && current.isPrimitiveType()
+        && (TypeUtil.isPromotionAllowed(incoming, current.asPrimitiveType())
+            || TypeUtil.isPromotionAllowed(current, incoming.asPrimitiveType()));
   }
 
   private Operation extractCdcOperation(Object recordValue, String cdcField) {
@@ -196,13 +295,27 @@ public class IcebergWriter implements RecordWriter {
   public synchronized WriteComplete complete() {
     flush();
 
+    List<WriterResult> normalized =
+        writerResults.stream()
+            .map(
+                files ->
+                    new WriterResult(
+                        files.tableIdentifier(),
+                        files.dataFiles().stream()
+                            .map(file -> PendingFileNormalizer.normalize(table, file))
+                            .collect(Collectors.toList()),
+                        files.deleteFiles().stream()
+                            .map(file -> PendingFileNormalizer.normalize(table, file))
+                            .collect(Collectors.toList()),
+                        table.spec().partitionType()))
+            .collect(Collectors.toList());
     WriteComplete result =
         new WriteComplete(
-            TableIdentifier.parse(tableName),
-            Lists.newArrayList(writerResults),
-            Maps.newHashMap(dataOffsets));
+            TableIdentifier.parse(tableName), normalized, Maps.newHashMap(dataOffsets));
     writerResults.clear();
     dataOffsets.clear();
+    pendingKeys.values().forEach(CompactKeyMap::clear);
+    pendingKeys.clear();
 
     return result;
   }
@@ -211,6 +324,7 @@ public class IcebergWriter implements RecordWriter {
   public void close() {
     try {
       writer.close();
+      pendingKeys.clear();
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }

@@ -140,7 +140,7 @@ public class SchemaUtils {
   }
 
   private static boolean typeMatches(org.apache.iceberg.Schema schema, UpdateType update) {
-    return schema.findType(update.name()).typeId() == update.type().typeId();
+    return schema.findType(update.name()).equals(update.type());
   }
 
   private static boolean isOptional(org.apache.iceberg.Schema schema, MakeOptional update) {
@@ -225,6 +225,10 @@ public class SchemaUtils {
 
     @SuppressWarnings("checkstyle:CyclomaticComplexity")
     Type toIcebergType(Schema valueSchema) {
+      if (config.schemaVariableDecimalAsString()
+          && "io.debezium.data.VariableScaleDecimal".equals(valueSchema.name())) {
+        return StringType.get();
+      }
       switch (valueSchema.type()) {
         case BOOLEAN:
           return BooleanType.get();
