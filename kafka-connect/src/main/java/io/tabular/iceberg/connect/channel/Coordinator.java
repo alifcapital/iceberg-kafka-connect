@@ -24,15 +24,17 @@ import static java.util.stream.Collectors.toMap;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.confluent.kafka.serializers.KafkaAvroSerializer;
 import io.tabular.iceberg.connect.IcebergSinkConfig;
+import io.tabular.iceberg.connect.data.PendingFileNormalizer;
 import io.tabular.iceberg.connect.events.DataOffsetsPayload;
 import io.tabular.iceberg.connect.events.EventType;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.time.Duration;
 import java.time.OffsetDateTime;
-import java.util.Collection;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -52,6 +54,11 @@ import org.apache.iceberg.Table;
 import org.apache.iceberg.Transaction;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.connect.events.CommitComplete;
+import org.apache.iceberg.connect.events.CommitToTable;
+import org.apache.iceberg.connect.events.Event;
+import org.apache.iceberg.connect.events.StartCommit;
+import org.apache.iceberg.connect.events.TableReference;
 import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
@@ -60,12 +67,6 @@ import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.util.Pair;
 import org.apache.iceberg.util.Tasks;
 import org.apache.iceberg.util.ThreadPools;
-import org.apache.iceberg.connect.events.Event;
-import org.apache.iceberg.connect.events.StartCommit;
-import org.apache.iceberg.connect.events.CommitComplete;
-import org.apache.iceberg.connect.events.CommitToTable;
-import org.apache.iceberg.connect.events.TableReference;
-import io.confluent.kafka.serializers.KafkaAvroSerializer;
 import org.apache.kafka.clients.admin.ListOffsetsResult;
 import org.apache.kafka.clients.admin.MemberDescription;
 import org.apache.kafka.clients.admin.OffsetSpec;
@@ -620,7 +621,9 @@ public class Coordinator extends Channel implements AutoCloseable {
           AppendFiles appendOp = transaction.newAppend();
           branch.ifPresent(appendOp::toBranch);
 
-          list.get(i).forEach(appendOp::appendFile);
+          list.get(i).stream()
+              .map(file -> PendingFileNormalizer.normalize(table, file))
+              .forEach(appendOp::appendFile);
           appendOp.set(COMMIT_ID_SNAPSHOT_PROP, commitState.currentCommitId().toString());
           if (i == lastIdx) {
             appendOp.set(controlTopicOffsetsProp, offsetsJson);
@@ -647,8 +650,12 @@ public class Coordinator extends Channel implements AutoCloseable {
         if (vtts != null) {
           deltaOp.set(VTTS_SNAPSHOT_PROP, Long.toString(vtts.toInstant().toEpochMilli()));
         }
-        dataFiles.forEach(deltaOp::addRows);
-        deleteFiles.forEach(deltaOp::addDeletes);
+        dataFiles.stream()
+            .map(file -> PendingFileNormalizer.normalize(table, file))
+            .forEach(deltaOp::addRows);
+        deleteFiles.stream()
+            .map(file -> PendingFileNormalizer.normalize(table, file))
+            .forEach(deltaOp::addDeletes);
         deltaOp.commit();
       }
 

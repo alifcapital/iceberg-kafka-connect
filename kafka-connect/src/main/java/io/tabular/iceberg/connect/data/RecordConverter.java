@@ -25,6 +25,7 @@ import io.tabular.iceberg.connect.IcebergSinkConfig;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.math.RoundingMode;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
@@ -54,8 +55,10 @@ import org.apache.iceberg.mapping.NameMapping;
 import org.apache.iceberg.mapping.NameMappingParser;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.Type.PrimitiveType;
+import org.apache.iceberg.types.TypeUtil;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.types.Types.DecimalType;
 import org.apache.iceberg.types.Types.ListType;
@@ -108,6 +111,163 @@ public class RecordConverter {
     throw new UnsupportedOperationException("Cannot convert type: " + data.getClass().getName());
   }
 
+  /** Plan all changes from the schema, including null structs and empty collections. */
+  public SchemaUpdate.Consumer planSchema(
+      org.apache.kafka.connect.data.Schema source, boolean cdcWithoutKey) {
+    if (source.type() != org.apache.kafka.connect.data.Schema.Type.STRUCT) {
+      throw new ConnectException("Expected a struct schema for an Iceberg row");
+    }
+    SchemaUpdate.Consumer updates = new SchemaUpdate.Consumer();
+    planStruct(source, tableSchema.asStruct(), -1, null, cdcWithoutKey, updates);
+    return updates;
+  }
+
+  @SuppressWarnings("checkstyle:CyclomaticComplexity")
+  private void planStruct(
+      org.apache.kafka.connect.data.Schema source,
+      StructType target,
+      int parentId,
+      String parentPath,
+      boolean cdcWithoutKey,
+      SchemaUpdate.Consumer updates) {
+    Set<Integer> present = Sets.newHashSet();
+    for (Field field : source.fields()) {
+      String name = field.name();
+      if ("_before_image".equals(name)) {
+        if (!writeBeforeImageToIceberg) {
+          continue;
+        }
+        name = "_cdc_before_image";
+      }
+      String path = parentPath == null ? name : parentPath + "." + name;
+      boolean protectedShape = cdcWithoutKey && !name.equals("_cdc") && !name.startsWith("_cdc_");
+      NestedField existing = lookupStructField(name, target, parentId);
+      if (existing == null) {
+        if (protectedShape) {
+          throw new ConnectException("Cannot ADD " + path + " in CDC without a primary key");
+        }
+        updates.addColumn(parentPath, name, SchemaUtils.toIcebergType(field.schema(), config));
+      } else {
+        present.add(existing.fieldId());
+        String actualPath = tableSchema.findColumnName(existing.fieldId());
+        planField(field.schema(), existing, actualPath, protectedShape, updates);
+      }
+    }
+    for (NestedField existing : target.fields()) {
+      // CDC metadata and before images are absent in some operations by design.
+      if (!present.contains(existing.fieldId())
+          && !existing.name().equals("_cdc")
+          && !existing.name().startsWith("_cdc_")) {
+        String path = tableSchema.findColumnName(existing.fieldId());
+        if (containsIdentifier(existing.type(), existing.fieldId())) {
+          throw new ConnectException("Cannot DROP identifier field " + path);
+        }
+        if (cdcWithoutKey) {
+          throw new ConnectException("Cannot DROP " + path + " in CDC without a primary key");
+        }
+        if (existing.isRequired()) {
+          updates.makeOptional(path);
+        }
+      }
+    }
+  }
+
+  private boolean containsIdentifier(Type type, int fieldId) {
+    if (identifierFieldIds.contains(fieldId)) {
+      return true;
+    }
+    if (type.isStructType()) {
+      for (NestedField child : type.asStructType().fields()) {
+        if (containsIdentifier(child.type(), child.fieldId())) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  @SuppressWarnings("checkstyle:CyclomaticComplexity")
+  private void planField(
+      org.apache.kafka.connect.data.Schema source,
+      NestedField target,
+      String path,
+      boolean cdcWithoutKey,
+      SchemaUpdate.Consumer updates) {
+    if (source.isOptional() && containsIdentifier(target.type(), target.fieldId())) {
+      throw new ConnectException("Cannot make identifier field nullable: " + path);
+    }
+    if (source.isOptional() && target.isRequired()) {
+      updates.makeOptional(path);
+    }
+    Type incoming = SchemaUtils.toIcebergType(source, config);
+    Type current = target.type();
+    if (incoming.isStructType() && current.isStructType()) {
+      planStruct(source, current.asStructType(), target.fieldId(), path, cdcWithoutKey, updates);
+    } else if (incoming.isListType() && current.isListType()) {
+      planField(
+          source.valueSchema(),
+          current.asListType().fields().get(0),
+          path + ".element",
+          cdcWithoutKey,
+          updates);
+    } else if (incoming.isMapType() && current.isMapType()) {
+      if (!sameTypeIgnoringIds(incoming.asMapType().keyType(), current.asMapType().keyType())) {
+        throw incompatible(
+            path + ".key", incoming.asMapType().keyType(), current.asMapType().keyType());
+      }
+      planField(
+          source.valueSchema(),
+          current.asMapType().fields().get(1),
+          path + ".value",
+          cdcWithoutKey,
+          updates);
+    } else if (incoming.isPrimitiveType() && current.isPrimitiveType()) {
+      if (TypeUtil.isPromotionAllowed(incoming, current.asPrimitiveType())) {
+        return;
+      }
+      if (TypeUtil.isPromotionAllowed(current, incoming.asPrimitiveType())) {
+        updates.updateType(path, incoming.asPrimitiveType());
+      } else {
+        throw incompatible(path, incoming, current);
+      }
+    } else {
+      throw incompatible(path, incoming, current);
+    }
+  }
+
+  private static boolean sameTypeIgnoringIds(Type left, Type right) {
+    if (left.typeId() != right.typeId()) {
+      return false;
+    }
+    if (left.isPrimitiveType()) {
+      return left.equals(right);
+    }
+    List<NestedField> leftFields = left.asNestedType().fields();
+    List<NestedField> rightFields = right.asNestedType().fields();
+    if (leftFields.size() != rightFields.size()) {
+      return false;
+    }
+    for (int i = 0; i < leftFields.size(); i++) {
+      if (!leftFields.get(i).name().equals(rightFields.get(i).name())
+          || leftFields.get(i).isOptional() != rightFields.get(i).isOptional()
+          || !sameTypeIgnoringIds(leftFields.get(i).type(), rightFields.get(i).type())) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private static ConnectException incompatible(String path, Type source, Type target) {
+    return new ConnectException(
+        "Incompatible schema at "
+            + path
+            + ": incoming "
+            + source
+            + ", Iceberg "
+            + target
+            + "; no lossless Iceberg v2 promotion is available");
+  }
+
   private NameMapping createNameMapping(Table table) {
     String nameMappingString = table.properties().get(TableProperties.DEFAULT_NAME_MAPPING);
     return nameMappingString != null ? NameMappingParser.fromJson(nameMappingString) : null;
@@ -148,6 +308,21 @@ public class RecordConverter {
       case BOOLEAN:
         return convertBoolean(value);
       case STRING:
+        if (config.schemaVariableDecimalAsString()
+            && "io.debezium.data.VariableScaleDecimal".equals(sourceSchemaName)) {
+          Struct decimal = (Struct) value;
+          Object bytes = decimal.get("value");
+          byte[] unscaled;
+          if (bytes instanceof ByteBuffer) {
+            ByteBuffer buffer = ((ByteBuffer) bytes).duplicate();
+            unscaled = new byte[buffer.remaining()];
+            buffer.get(unscaled);
+          } else {
+            unscaled = (byte[]) bytes;
+          }
+          return new BigDecimal(new BigInteger(unscaled), decimal.getInt32("scale"))
+              .toPlainString();
+        }
         return convertString(value);
       case UUID:
         return convertUUID(value);
@@ -453,7 +628,11 @@ public class RecordConverter {
       throw new IllegalArgumentException(
           "Cannot convert to BigDecimal: " + value.getClass().getName());
     }
-    return bigDecimal.setScale(type.scale(), RoundingMode.HALF_UP);
+    BigDecimal scaled = bigDecimal.setScale(type.scale(), RoundingMode.UNNECESSARY);
+    if (scaled.precision() > type.precision()) {
+      throw new ConnectException("Decimal value exceeds target " + type);
+    }
+    return scaled;
   }
 
   protected boolean convertBoolean(Object value) {

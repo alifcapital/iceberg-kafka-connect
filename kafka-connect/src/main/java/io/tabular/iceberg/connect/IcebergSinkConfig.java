@@ -82,6 +82,8 @@ public class IcebergSinkConfig extends AbstractConfig {
       "iceberg.tables.auto-create-enabled";
   private static final String TABLES_EVOLVE_SCHEMA_ENABLED_PROP =
       "iceberg.tables.evolve-schema-enabled";
+  private static final String TABLES_VARIABLE_DECIMAL_AS_STRING_PROP =
+      "iceberg.tables.schema-variable-decimal-as-string";
   private static final String TABLES_SCHEMA_FORCE_OPTIONAL_PROP =
       "iceberg.tables.schema-force-optional";
   private static final String TABLES_SCHEMA_CASE_INSENSITIVE_PROP =
@@ -203,6 +205,12 @@ public class IcebergSinkConfig extends AbstractConfig {
         false,
         Importance.MEDIUM,
         "Set to true to add any missing record fields to the table schema, false otherwise");
+    configDef.define(
+        TABLES_VARIABLE_DECIMAL_AS_STRING_PROP,
+        Type.BOOLEAN,
+        false,
+        Importance.MEDIUM,
+        "Decode Debezium VariableScaleDecimal as an exact decimal string; requires migration of existing struct columns");
     configDef.define(
         TABLES_SCHEMA_DEBEZIUM_TIME_TYPES_PROP,
         Type.BOOLEAN,
@@ -524,6 +532,10 @@ public class IcebergSinkConfig extends AbstractConfig {
 
   public boolean evolveSchemaEnabled() {
     return getBoolean(TABLES_EVOLVE_SCHEMA_ENABLED_PROP);
+  }
+
+  public boolean schemaVariableDecimalAsString() {
+    return getBoolean(TABLES_VARIABLE_DECIMAL_AS_STRING_PROP);
   }
 
   public boolean schemaForceOptional() {

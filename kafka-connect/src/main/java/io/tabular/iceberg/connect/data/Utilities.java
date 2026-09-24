@@ -18,7 +18,6 @@
  */
 package io.tabular.iceberg.connect.data;
 
-import static java.util.stream.Collectors.toSet;
 import static org.apache.iceberg.TableProperties.DEFAULT_FILE_FORMAT;
 import static org.apache.iceberg.TableProperties.DEFAULT_FILE_FORMAT_DEFAULT;
 import static org.apache.iceberg.TableProperties.WRITE_TARGET_FILE_SIZE_BYTES;
@@ -168,7 +167,9 @@ public class Utilities {
 
     // If CDC/upsert mode but no identifier fields in schema, use all primitive columns
     // This supports CDC without PK (like PostgreSQL REPLICA_IDENTITY_FULL)
-    boolean isCdcMode = config.tablesCdcField() != null || config.upsertModeEnabled();
+    boolean isCdcMode =
+        !config.tableConfig(tableName).appendOnly()
+            && (config.tablesCdcField() != null || config.upsertModeEnabled());
     if (isCdcMode && !hasRealPk) {
       identifierFieldIds = collectEqualityDeleteFieldIds(table.schema(), tableName);
       LOG.info("Upsert mode without PK for table {}, using {} columns for equality delete",

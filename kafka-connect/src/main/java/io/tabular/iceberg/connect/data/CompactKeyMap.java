@@ -33,6 +33,7 @@ import org.apache.iceberg.types.Types;
  * Ultra-compact key-to-position map optimized for CDC workloads.
  *
  * <p>Storage format:
+ *
  * <ul>
  *   <li>Path → int index via dictionary (interning)
  *   <li>Position → int (supports up to 2B rows per file)
@@ -40,6 +41,7 @@ import org.apache.iceberg.types.Types;
  * </ul>
  *
  * <p>Memory per entry:
+ *
  * <ul>
  *   <li>LONG key: ~20 bytes (open addressing: long key + long value)
  *   <li>STRING key: ~28 bytes (open addressing: String ref + long value + overhead)
@@ -197,6 +199,9 @@ public abstract class CompactKeyMap {
 
   public abstract PathOffset remove(Record key);
 
+  /** Refresh type metadata while retaining positions across a compatible schema evolution. */
+  public void updateSchema(Schema schema) {}
+
   public abstract int size();
 
   public abstract void clear();
@@ -209,15 +214,24 @@ public abstract class CompactKeyMap {
     private static final int INITIAL_CAPACITY = 1024;
     private static final float LOAD_FACTOR = 0.5f;
 
-    private final boolean keyIsInteger;
+    private boolean keyIsInteger;
     private final String keyFieldName;
-    private final Record reusableKeyRecord;
+    private Record reusableKeyRecord;
     private CompactKeyMap delegate;
 
     private long[] keys;
     private long[] values; // packed (pathIndex << 32) | position
     private int size;
     private int threshold;
+
+    @Override
+    public void updateSchema(Schema schema) {
+      keyIsInteger = schema.columns().get(0).type().typeId() == Type.TypeID.INTEGER;
+      reusableKeyRecord = GenericRecord.create(schema);
+      if (delegate != null) {
+        delegate.updateSchema(schema);
+      }
+    }
 
     LongKeyMap(Schema deleteSchema) {
       this.keyIsInteger = deleteSchema.columns().get(0).type().typeId() == Type.TypeID.INTEGER;
@@ -930,8 +944,12 @@ public abstract class CompactKeyMap {
           vals[i] = null;
         } else if (val instanceof Integer) {
           vals[i] = ((Integer) val).longValue();
-        } else if (val instanceof Long || val instanceof BigDecimal || val instanceof Boolean
-            || val instanceof Double || val instanceof Float) {
+        } else if (val instanceof Float) {
+          vals[i] = ((Float) val).doubleValue();
+        } else if (val instanceof Long
+            || val instanceof BigDecimal
+            || val instanceof Boolean
+            || val instanceof Double) {
           vals[i] = val; // immutable
         } else if (val instanceof CharSequence) {
           vals[i] = val.toString();
@@ -1050,6 +1068,11 @@ public abstract class CompactKeyMap {
     }
 
     @Override
+    public void updateSchema(Schema schema) {
+      delegate.updateSchema(schema);
+    }
+
+    @Override
     public String getPath(int index) {
       return delegate.getPath(index);
     }
@@ -1062,8 +1085,12 @@ public abstract class CompactKeyMap {
           vals[i] = null;
         } else if (val instanceof Integer) {
           vals[i] = ((Integer) val).longValue();
-        } else if (val instanceof Long || val instanceof BigDecimal || val instanceof Boolean
-            || val instanceof Double || val instanceof Float) {
+        } else if (val instanceof Float) {
+          vals[i] = ((Float) val).doubleValue();
+        } else if (val instanceof Long
+            || val instanceof BigDecimal
+            || val instanceof Boolean
+            || val instanceof Double) {
           vals[i] = val;
         } else if (val instanceof CharSequence) {
           vals[i] = val.toString();

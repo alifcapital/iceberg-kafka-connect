@@ -33,6 +33,7 @@ The zip archive will be found under `./kafka-connect-runtime/build/distributions
 | iceberg.tables.auto-create-enabled         | Set to `true` to automatically create destination tables, default is `false`                                     |
 | iceberg.tables.evolve-schema-enabled       | Set to `true` to add any missing record fields to the table schema, default is `false`                           |
 | iceberg.tables.schema-force-optional       | Set to `true` to set columns as optional during table create and evolution, default is `false` to respect schema |
+| iceberg.tables.schema-variable-decimal-as-string | Decode Debezium `VariableScaleDecimal` as an exact decimal string. Default `false` preserves the existing struct representation. Migrate existing columns and queries before enabling. |
 | iceberg.tables.schema-case-insensitive     | Set to `true` to look up table columns by case-insensitive name, default is `false` for case-sensitive           |
 | iceberg.tables.auto-create-props.*         | Properties set on new tables during auto-create                                                                  |
 | iceberg.tables.write-props.*               | Properties passed through to Iceberg writer initialization, these take precedence                                |
@@ -325,3 +326,38 @@ See above for creating the table
 ## Resources
 
 * [Running IcebergSinkConnector locally](https://github.com/wuerike/kafka-iceberg-streaming)
+
+### Schema evolution with schemaful CDC records
+
+With `iceberg.tables.evolve-schema-enabled=true`, the sink checks the complete incoming
+Connect schema before converting a row, including null structs and empty lists/maps.
+Successful checks are cached for the current table schema (up to 64 incoming schemas).
+The format-v2 policy allows `int` to `long`, `float` to `double`, and decimal precision
+widening at unchanged scale. Narrower input types can still be written into an already
+widened table column. Incompatible types fail before value conversion; parsing a string
+or truncating a number is not considered schema compatibility. Map keys cannot evolve.
+
+Added ordinary fields are optional in Iceberg. Disappearing fields are retained and
+made optional; new records contain null for them. Tightening source nullability does
+not make historical Iceberg columns required. Reusing a disappeared name must remain
+compatible with the retained column type. Fields in structs, list elements and map
+values are checked recursively. Reserved CDC metadata is excluded from missing-field
+and no-PK shape checks.
+
+Fixed-scale Connect Decimal fields map to `decimal(38, scale)`. Existing narrower
+columns can widen their precision. Scale changes, rounding and precision overflow fail.
+Unconstrained PostgreSQL numeric remains `struct<scale:int,value:binary>` by default.
+The opt-in `schema-variable-decimal-as-string` flag decodes it exactly to text;
+existing struct columns cannot evolve to string and must be migrated separately.
+
+Identifier fields must remain present and required. When Kafka keys supply identifiers
+(no explicit `id-columns` override), their field names must match the table identifiers.
+Compatible identifier widening such as `int` to `long` is supported. Pending row
+positions survive writer rotations within a commit window, so CDC deletes can still
+remove records written before a schema change in the same commit.
+
+In CDC/upsert mode without table identifiers, adding or removing ordinary fields fails
+before schema mutation or recording the event offset. This also applies to tables
+configured with `iceberg.table.<table>.has-real-pk=false`. Append-only tables are exempt.
+These schema checks require schemaful records; schemaless Map records retain their
+existing inference/conversion path. This policy does not alter Schema Registry settings.
