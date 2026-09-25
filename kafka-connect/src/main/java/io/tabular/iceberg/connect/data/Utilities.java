@@ -271,7 +271,15 @@ public class Utilities {
                 hasRealPk);
       }
     }
+    configureDeltaWriter(writer, tableProps);
     return writer;
+  }
+
+  private static void configureDeltaWriter(
+      TaskWriter<Record> writer, Map<String, String> properties) {
+    if (writer instanceof CompactDeltaTaskWriter) {
+      ((CompactDeltaTaskWriter) writer).setWriterProperties(properties);
+    }
   }
 
   /**
@@ -318,8 +326,9 @@ public class Utilities {
 
     if (!floatDoubleWarnings.isEmpty()) {
       LOG.warn(
-          "Table {} has FLOAT/DOUBLE columns that will be used for equality deletes: {}. "
-              + "NaN values may not match correctly in some query engines (e.g., StarRocks with single-column keys).",
+          "Table {} has FLOAT/DOUBLE columns that will be used for equality deletes: {}. NaN values"
+              + " may not match correctly in some query engines (e.g., StarRocks with single-column"
+              + " keys).",
           tableName,
           String.join(", ", floatDoubleWarnings));
     }

@@ -82,6 +82,9 @@ public class RecordConverter {
           .toFormatter();
 
   private final Schema tableSchema;
+  private final Set<Integer> partitionSourceIds = Sets.newHashSet();
+  private final Map<org.apache.kafka.connect.data.Schema, Set<Integer>> sourceFieldIds =
+      Maps.newHashMap();
   private final NameMapping nameMapping;
   private final IcebergSinkConfig config;
   private final Set<Integer> identifierFieldIds;
@@ -94,6 +97,20 @@ public class RecordConverter {
 
   public RecordConverter(Table table, IcebergSinkConfig config, boolean writeBeforeImageToIceberg) {
     this.tableSchema = table.schema();
+    if (table.specs() != null) {
+      table
+          .specs()
+          .values()
+          .forEach(
+              spec ->
+                  spec.fields()
+                      .forEach(
+                          field -> {
+                            if (!field.transform().isVoid()) {
+                              partitionSourceIds.add(field.sourceId());
+                            }
+                          }));
+    }
     this.nameMapping = createNameMapping(table);
     this.config = config;
     this.identifierFieldIds = table.schema().identifierFieldIds();
@@ -106,9 +123,86 @@ public class RecordConverter {
 
   public Record convert(Object data, SchemaUpdate.Consumer schemaUpdateConsumer) {
     if (data instanceof Struct || data instanceof Map) {
-      return convertStructValue(data, tableSchema.asStruct(), -1, schemaUpdateConsumer);
+      Record row = convertStructValue(data, tableSchema.asStruct(), -1, schemaUpdateConsumer);
+      if (identifierFieldIds.isEmpty()
+          && (config.tablesCdcField() != null || config.upsertModeEnabled())) {
+        return new RecordWrapper(row, Operation.INSERT, null, sourceFieldIds(data));
+      }
+      return row;
     }
     throw new UnsupportedOperationException("Cannot convert type: " + data.getClass().getName());
+  }
+
+  private boolean containsPartitionSource(NestedField field) {
+    if (partitionSourceIds.contains(field.fieldId())) {
+      return true;
+    }
+    return field.type().isStructType()
+        && field.type().asStructType().fields().stream().anyMatch(this::containsPartitionSource);
+  }
+
+  // Field presence is taken from the source schema, even when a nested struct is null.
+  // Schemaless records use map membership: an explicit null still participates in equality.
+  private Set<Integer> sourceFieldIds(Object data) {
+    if (data instanceof Struct) {
+      org.apache.kafka.connect.data.Schema source = ((Struct) data).schema();
+      if (sourceFieldIds.size() >= 64) {
+        sourceFieldIds.clear();
+      }
+      return sourceFieldIds.computeIfAbsent(source, ignored -> collectSourceFieldIds(source, null));
+    }
+    return collectSourceFieldIds(null, data);
+  }
+
+  private Set<Integer> collectSourceFieldIds(
+      org.apache.kafka.connect.data.Schema source, Object data) {
+    Set<Integer> ids = Sets.newHashSet();
+    collectSourceFields(source, data, tableSchema.asStruct(), -1, ids);
+    return Set.copyOf(ids);
+  }
+
+  private void collectSourceFields(
+      org.apache.kafka.connect.data.Schema source,
+      Object data,
+      StructType target,
+      int parentId,
+      Set<Integer> ids) {
+    if (source != null) {
+      for (Field field : source.fields()) {
+        collectSourceField(field.name(), field.schema(), null, target, parentId, ids);
+      }
+    } else if (data instanceof Map) {
+      ((Map<?, ?>) data)
+          .forEach(
+              (name, value) ->
+                  collectSourceField(name.toString(), null, value, target, parentId, ids));
+    } else {
+      // A present, null schemaless struct means null for all of its children.
+      for (NestedField field : target.fields()) {
+        collectSourceField(field.name(), null, null, target, parentId, ids);
+      }
+    }
+  }
+
+  private void collectSourceField(
+      String name,
+      org.apache.kafka.connect.data.Schema source,
+      Object data,
+      StructType target,
+      int parentId,
+      Set<Integer> ids) {
+    if (name.equals("_before_image")) {
+      return;
+    }
+    NestedField field = lookupStructField(name, target, parentId);
+    if (field == null) {
+      return;
+    }
+    if (field.type().isStructType()) {
+      collectSourceFields(source, data, field.type().asStructType(), field.fieldId(), ids);
+    } else if (field.type().isPrimitiveType()) {
+      ids.add(field.fieldId());
+    }
   }
 
   /** Plan all changes from the schema, including null structs and empty collections. */
@@ -119,6 +213,13 @@ public class RecordConverter {
     }
     SchemaUpdate.Consumer updates = new SchemaUpdate.Consumer();
     planStruct(source, tableSchema.asStruct(), -1, null, cdcWithoutKey, updates);
+    if (cdcWithoutKey
+        && Sets.intersection(
+                collectSourceFieldIds(source, null),
+                Utilities.collectEqualityDeleteFieldIds(tableSchema, "schema preflight"))
+            .isEmpty()) {
+      throw new ConnectException("Cannot DROP all equality fields in CDC without a primary key");
+    }
     return updates;
   }
 
@@ -162,8 +263,9 @@ public class RecordConverter {
         if (containsIdentifier(existing.type(), existing.fieldId())) {
           throw new ConnectException("Cannot DROP identifier field " + path);
         }
-        if (cdcWithoutKey) {
-          throw new ConnectException("Cannot DROP " + path + " in CDC without a primary key");
+        if (cdcWithoutKey && containsPartitionSource(existing)) {
+          throw new ConnectException(
+              "Cannot DROP partition source field " + path + " in CDC without a primary key");
         }
         if (existing.isRequired()) {
           updates.makeOptional(path);

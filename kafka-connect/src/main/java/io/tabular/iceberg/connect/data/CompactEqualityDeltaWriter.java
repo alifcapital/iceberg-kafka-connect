@@ -41,6 +41,7 @@ import org.apache.iceberg.io.FileWriter;
 import org.apache.iceberg.io.OutputFileFactory;
 import org.apache.iceberg.io.WriteResult;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.types.TypeUtil;
 import org.apache.iceberg.util.CharSequenceSet;
@@ -102,6 +103,7 @@ public class CompactEqualityDeltaWriter implements Closeable {
   // Writers
   private RollingDataWriterWrapper dataWriter;
   private RollingEqDeleteWriterWrapper eqDeleteWriter;
+  private final Map<Set<Integer>, PartialDeleteWriter> partialDeleteWriters = Maps.newHashMap();
   private FileWriter<PositionDelete<Record>, DeleteWriteResult> posDeleteWriter;
 
   // Results
@@ -139,7 +141,7 @@ public class CompactEqualityDeltaWriter implements Closeable {
 
     // Initialize writers
     this.dataWriter = new RollingDataWriterWrapper();
-    this.eqDeleteWriter = new RollingEqDeleteWriterWrapper();
+    this.eqDeleteWriter = new RollingEqDeleteWriterWrapper(appenderFactory);
     this.posDeleteWriter =
         new SortingPositionOnlyDeleteWriter<>(
             () -> appenderFactory.newPosDeleteWriter(newOutputFile(), format, partition),
@@ -166,7 +168,8 @@ public class CompactEqualityDeltaWriter implements Closeable {
 
     // Track position for deleteKey() lookups
     // For deduplicateInserts=true: put() replaces previous and returns it for position delete
-    // For deduplicateInserts=false: put() tracks all positions, returns null (handled by MultiValueWrapper)
+    // For deduplicateInserts=false: put() tracks all positions, returns null (handled by
+    // NoPkKeyMap)
     CompactKeyMap.PathOffset previous = insertedRowMap.put(keyRecord, currentPath, currentRows);
 
     if (deduplicateInserts && previous != null) {
@@ -187,6 +190,33 @@ public class CompactEqualityDeltaWriter implements Closeable {
       writePosDelete(insertedRowMap.getPath(previous.pathIndex), previous.position);
     } else {
       eqDeleteWriter.write(keyRecord);
+    }
+  }
+
+  /** Delete using only fields present in the source before image. */
+  void deleteFields(Record fullKey, Set<Integer> fieldIds, FileAppenderFactory<Record> factory)
+      throws IOException {
+    if (deduplicateInserts || fieldIds.isEmpty()) {
+      throw new IllegalArgumentException("Partial equality deletes require nonempty no-PK fields");
+    }
+    PartialDeleteWriter deletes =
+        partialDeleteWriters.computeIfAbsent(
+            Set.copyOf(fieldIds), ids -> new PartialDeleteWriter(ids, factory));
+    insertedRowMap.removeMatching(
+        fullKey,
+        fieldIds,
+        offset -> writePosDelete(insertedRowMap.getPath(offset.pathIndex), offset.position));
+    // A partial key can match both pending rows and rows from earlier commits.
+    deletes.writer.write(deletes.projection.wrap(fullKey));
+  }
+
+  private class PartialDeleteWriter {
+    private final RecordProjection projection;
+    private final RollingEqDeleteWriterWrapper writer;
+
+    PartialDeleteWriter(Set<Integer> ids, FileAppenderFactory<Record> factory) {
+      projection = RecordProjection.create(deleteSchema, TypeUtil.select(deleteSchema, ids));
+      writer = new RollingEqDeleteWriterWrapper(factory);
     }
   }
 
@@ -268,6 +298,12 @@ public class CompactEqualityDeltaWriter implements Closeable {
         }
         eqDeleteWriter = null;
       }
+
+      for (PartialDeleteWriter deletes : partialDeleteWriters.values()) {
+        deletes.writer.close();
+        completedDeleteFiles.addAll(deletes.writer.result().deleteFiles());
+      }
+      partialDeleteWriters.clear();
 
       // Close pos delete writer
       if (posDeleteWriter != null) {
@@ -382,7 +418,10 @@ public class CompactEqualityDeltaWriter implements Closeable {
     private final List<DeleteFile> deleteFiles = Lists.newArrayList();
     private boolean closed = false;
 
-    RollingEqDeleteWriterWrapper() {
+    private final FileAppenderFactory<Record> deleteFactory;
+
+    RollingEqDeleteWriterWrapper(FileAppenderFactory<Record> deleteFactory) {
+      this.deleteFactory = deleteFactory;
       openCurrent();
     }
 
@@ -402,7 +441,7 @@ public class CompactEqualityDeltaWriter implements Closeable {
 
     private void openCurrent() {
       this.currentFile = newOutputFile();
-      this.currentWriter = appenderFactory.newEqDeleteWriter(currentFile, format, partition);
+      this.currentWriter = deleteFactory.newEqDeleteWriter(currentFile, format, partition);
       this.currentRows = 0;
     }
 

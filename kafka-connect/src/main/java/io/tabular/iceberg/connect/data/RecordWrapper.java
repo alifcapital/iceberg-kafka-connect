@@ -19,6 +19,7 @@
 package io.tabular.iceberg.connect.data;
 
 import java.util.Map;
+import java.util.Set;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.types.Types.StructType;
 
@@ -27,15 +28,25 @@ public class RecordWrapper implements Record {
   private final Record delegate;
   private final Operation op;
   private final Record before;
+  private final Set<Integer> sourceFieldIds;
 
   public RecordWrapper(Record delegate, Operation op) {
     this(delegate, op, null);
   }
 
   public RecordWrapper(Record delegate, Operation op, Record before) {
+    this(delegate, op, before, sourceFieldIds(delegate));
+  }
+
+  RecordWrapper(Record delegate, Operation op, Record before, Set<Integer> sourceFieldIds) {
     this.delegate = delegate;
     this.op = op;
     this.before = before;
+    this.sourceFieldIds = sourceFieldIds;
+  }
+
+  static Set<Integer> sourceFieldIds(Record record) {
+    return record instanceof RecordWrapper ? ((RecordWrapper) record).sourceFieldIds : null;
   }
 
   public Operation op() {
@@ -68,12 +79,14 @@ public class RecordWrapper implements Record {
 
   @Override
   public Record copy() {
-    return new RecordWrapper(delegate.copy(), op, before != null ? before.copy() : null);
+    return new RecordWrapper(
+        delegate.copy(), op, before != null ? before.copy() : null, sourceFieldIds);
   }
 
   @Override
   public Record copy(Map<String, Object> overwriteValues) {
-    return new RecordWrapper(delegate.copy(overwriteValues), op, before != null ? before.copy() : null);
+    return new RecordWrapper(
+        delegate.copy(overwriteValues), op, before != null ? before.copy() : null, sourceFieldIds);
   }
 
   @Override

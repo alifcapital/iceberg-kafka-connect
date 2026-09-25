@@ -356,8 +356,19 @@ Compatible identifier widening such as `int` to `long` is supported. Pending row
 positions survive writer rotations within a commit window, so CDC deletes can still
 remove records written before a schema change in the same commit.
 
-In CDC/upsert mode without table identifiers, adding or removing ordinary fields fails
-before schema mutation or recording the event offset. This also applies to tables
-configured with `iceberg.table.<table>.has-real-pk=false`. Append-only tables are exempt.
-These schema checks require schemaful records; schemaless Map records retain their
-existing inference/conversion path. This policy does not alter Schema Registry settings.
+In CDC/upsert mode without table identifiers (including tables created with
+`iceberg.table.<table>.has-real-pk=false`), ordinary source fields can disappear. The
+Iceberg columns remain optional. DELETE and UPDATE before images compare only the
+fields present in the source schema; an explicit null remains an equality condition.
+Files with different equality-field sets are written separately. The same condition
+removes matching pending rows using position deletes, including across writer rotations.
+A partial equality delete matches all rows with those remaining values, as specified by
+Iceberg; it does not distinguish rows by the disappeared columns. A null struct remains
+distinct from a non-null struct whose selected children are null.
+
+Adding ordinary fields, dropping all equality fields, and dropping a partition source
+field still fail schema preflight. Partition sources from historical specs are protected
+too. Append-only tables are exempt. Schema preflight requires schemaful records;
+schemaless Map records retain their inference/conversion path, but their deletes also
+preserve the difference between absent fields and explicit nulls. Identifier-field
+protections and Schema Registry settings are unchanged.
