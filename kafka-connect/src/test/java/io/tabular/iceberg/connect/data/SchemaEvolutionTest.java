@@ -216,15 +216,26 @@ class SchemaEvolutionTest {
         .hasMessageContaining("x");
     assertThatThrownBy(() -> converter.planSchema(SchemaBuilder.struct().build(), true))
         .hasMessageContaining("Cannot DROP");
+    assertThat(
+            converter
+                .planSchema(
+                    SchemaBuilder.struct()
+                        .field("x", Schema.INT32_SCHEMA)
+                        .field("added", Schema.STRING_SCHEMA)
+                        .build(),
+                    true)
+                .addColumns())
+        .extracting(SchemaUpdate.AddColumn::name)
+        .containsExactly("added");
     assertThatThrownBy(
             () ->
                 converter.planSchema(
                     SchemaBuilder.struct()
                         .field("x", Schema.INT32_SCHEMA)
-                        .field("added", Schema.STRING_SCHEMA)
+                        .field("added", SchemaBuilder.string().defaultValue("d").build())
                         .build(),
                     true))
-        .hasMessageContaining("Cannot ADD");
+        .hasMessageContaining("Cannot ADD added with default d");
   }
 
   @Test
@@ -395,7 +406,7 @@ class SchemaEvolutionTest {
     Schema source =
         SchemaBuilder.struct()
             .field("x", Schema.INT32_SCHEMA)
-            .field("new_col", Schema.STRING_SCHEMA)
+            .field("new_col", SchemaBuilder.string().defaultValue("d").build())
             .build();
     try {
       assertThatThrownBy(
@@ -409,7 +420,8 @@ class SchemaEvolutionTest {
                           source,
                           new Struct(source).put("x", 1).put("new_col", "new"),
                           42)))
-          .hasRootCauseMessage("Cannot ADD new_col in CDC without a primary key");
+          .rootCause()
+          .hasMessageContaining("Cannot ADD new_col with default d to table");
       assertThat(table.schema().findField("new_col")).isNull();
       assertThat(writer.complete().dataOffsets()).isEmpty();
     } finally {

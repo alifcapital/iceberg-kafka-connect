@@ -175,6 +175,84 @@ class NoPkColumnDropDeleteTest {
     }
   }
 
+  @ParameterizedTest
+  @CsvSource({
+    "DELETE, true, false", "UPDATE, true, false",
+    "DELETE, false, false", "UPDATE, false, false",
+    "DELETE, true, true", "UPDATE, true, true",
+    "DELETE, false, true", "UPDATE, false, true"
+  })
+  void sinkHandlesAddWithoutDefaultAcrossCommitsAndWriterRotations(
+      Operation operation, boolean commitInitial, boolean partitioned) throws Exception {
+    Table table = table(false, partitioned);
+    IcebergSinkConfig config = config();
+    Schema added =
+        SchemaBuilder.struct()
+            .field("a", Schema.INT32_SCHEMA)
+            .field("b", Schema.OPTIONAL_INT32_SCHEMA)
+            .field("c", Schema.OPTIONAL_STRING_SCHEMA)
+            .build();
+    IcebergWriter writer = new IcebergWriter(table, "db.test", config, false);
+    try {
+      writer.write(event(ORIGINAL_SCHEMA, 10, 20, Operation.INSERT, null, 0));
+      writer.write(event(ORIGINAL_SCHEMA, 99, 30, Operation.INSERT, null, 1));
+      if (commitInitial) {
+        commit(table, writer.complete());
+        writer.close();
+        writer = new IcebergWriter(table, "db.test", config, false);
+      }
+      // Rows written before ADD have no c in Iceberg; the source before image carries c=null.
+      Struct before = new Struct(added).put("a", 10).put("b", 20).put("c", null);
+      Struct value =
+          operation == Operation.UPDATE
+              ? new Struct(added).put("a", 11).put("b", 20).put("c", "new")
+              : before;
+      writer.write(cdcEvent(value, operation, before, 2));
+      commit(table, writer.complete());
+    } finally {
+      writer.close();
+    }
+    assertThat(table.schema().findField("c").isOptional()).isTrue();
+    if (operation == Operation.UPDATE) {
+      assertThat(readRows(table, "c"))
+          .containsExactlyInAnyOrder(tuple(99, 30, null), tuple(11, 20, "new"));
+    } else {
+      assertThat(readRows(table, "c")).containsExactly(tuple(99, 30, null));
+    }
+  }
+
+  @Test
+  void rejectsAddWithDefaultBeforeSchemaOrOffsetChanges() {
+    Table table = table(false, false);
+    int schemaId = table.schema().schemaId();
+    Schema added =
+        SchemaBuilder.struct()
+            .field("a", Schema.INT32_SCHEMA)
+            .field("b", Schema.OPTIONAL_INT32_SCHEMA)
+            .field("c", SchemaBuilder.string().optional().defaultValue("{}").build())
+            .build();
+    IcebergWriter writer = new IcebergWriter(table, "db.test", config(), false);
+    try {
+      assertThatThrownBy(
+              () ->
+                  writer.write(
+                      cdcEvent(
+                          new Struct(added).put("a", 10).put("b", 20).put("c", "{}"),
+                          Operation.INSERT,
+                          null,
+                          0)))
+          .hasRootCauseMessage(
+              "Cannot ADD c with default {} to table "
+                  + table.name()
+                  + " in CDC without a primary key: existing Iceberg rows would keep null"
+                  + " while source rows have the default, backfill them manually");
+      assertThat(table.schema().schemaId()).isEqualTo(schemaId);
+      assertThat(writer.complete().dataOffsets()).isEmpty();
+    } finally {
+      writer.close();
+    }
+  }
+
   @Test
   void explicitNullAndMissingFieldUseDifferentDeleteFiles() throws Exception {
     Table table = table(false, false);
@@ -434,6 +512,22 @@ class NoPkColumnDropDeleteTest {
     return new SinkRecord("source", 0, null, null, schema, value, offset);
   }
 
+  private SinkRecord cdcEvent(Struct source, Operation operation, Struct before, long offset) {
+    SchemaBuilder builder = SchemaBuilder.struct();
+    source.schema().fields().forEach(field -> builder.field(field.name(), field.schema()));
+    builder.field("_cdc_op", Schema.STRING_SCHEMA);
+    if (before != null) {
+      builder.field("_before_image", before.schema());
+    }
+    Schema schema = builder.build();
+    Struct value = new Struct(schema).put("_cdc_op", operation.name());
+    source.schema().fields().forEach(field -> value.put(field.name(), source.get(field)));
+    if (before != null) {
+      value.put("_before_image", before);
+    }
+    return new SinkRecord("source", 0, null, null, schema, value, offset);
+  }
+
   private void commit(Table table, WriteComplete result) {
     RowDelta delta = table.newRowDelta();
     for (WriterResult files : result.writerResults()) {
@@ -459,6 +553,16 @@ class NoPkColumnDropDeleteTest {
     try (CloseableIterable<Record> rows = IcebergGenerics.read(table).build()) {
       for (Record row : rows) {
         result.add(tuple(row.getField("a"), row.getField("b")));
+      }
+    }
+    return result;
+  }
+
+  private List<Tuple> readRows(Table table, String extra) throws Exception {
+    List<Tuple> result = Lists.newArrayList();
+    try (CloseableIterable<Record> rows = IcebergGenerics.read(table).build()) {
+      for (Record row : rows) {
+        result.add(tuple(row.getField("a"), row.getField("b"), row.getField(extra)));
       }
     }
     return result;

@@ -35,9 +35,9 @@ import org.apache.iceberg.types.Types;
 
 /** Pending no-PK rows, with lazily built indexes for deletes after a source column DROP. */
 class NoPkKeyMap extends CompactKeyMap {
-  private final List<Integer> fieldIds;
+  private List<Integer> fieldIds;
   private Schema schema;
-  private final Map<CompactKey, List<Long>> positions = Maps.newHashMap();
+  private Map<CompactKey, List<Long>> positions = Maps.newHashMap();
   private final Map<Set<Integer>, PartialIndex> partialIndexes = Maps.newHashMap();
   private int size;
 
@@ -55,10 +55,24 @@ class NoPkKeyMap extends CompactKeyMap {
 
   @Override
   public void updateSchema(Schema newSchema) {
-    if (!fieldIds.equals(primitiveIds(newSchema))
-        || (this.schema != null && !sameFieldOrder(this.schema.asStruct(), newSchema.asStruct()))) {
+    List<Integer> newFieldIds = primitiveIds(newSchema);
+    if (this.schema == null
+        || (fieldIds.equals(newFieldIds)
+            && sameFieldOrder(this.schema.asStruct(), newSchema.asStruct()))) {
+      this.schema = newSchema;
+      return;
+    }
+    // Source DROP retains Iceberg columns, so only an ADD can change the field set.
+    if (!newFieldIds.containsAll(fieldIds)) {
       throw new IllegalArgumentException("Cannot change pending no-PK equality fields");
     }
+    // Rows written before ADD read the new columns as null, so key them the same way.
+    KeyProjection widen = new KeyProjection(this.schema.asStruct(), newSchema.asStruct());
+    Map<CompactKey, List<Long>> widened = Maps.newHashMap();
+    positions.forEach((key, offsets) -> widened.put(widen.project(key), offsets));
+    this.positions = widened;
+    this.partialIndexes.clear();
+    this.fieldIds = newFieldIds;
     this.schema = newSchema;
   }
 
@@ -181,6 +195,7 @@ class NoPkKeyMap extends CompactKeyMap {
   }
 
   // Preserve struct presence as well as leaf values, matching Iceberg's equality projection.
+  // Target fields missing from the source project to null.
   private static class KeyProjection {
     private final int[] positions;
     private final KeyProjection[] nested;
@@ -192,7 +207,7 @@ class NoPkKeyMap extends CompactKeyMap {
         Types.NestedField field = target.fields().get(i);
         int position = source.fields().indexOf(source.field(field.fieldId()));
         positions[i] = position;
-        if (field.type().isStructType()) {
+        if (position >= 0 && field.type().isStructType()) {
           nested[i] =
               new KeyProjection(
                   source.fields().get(position).type().asStructType(), field.type().asStructType());
@@ -203,6 +218,9 @@ class NoPkKeyMap extends CompactKeyMap {
     CompactKey project(CompactKey fullKey) {
       Object[] values = new Object[positions.length];
       for (int i = 0; i < positions.length; i++) {
+        if (positions[i] < 0) {
+          continue;
+        }
         Object value = fullKey.values[positions[i]];
         values[i] =
             nested[i] != null && value != null ? nested[i].project((CompactKey) value) : value;

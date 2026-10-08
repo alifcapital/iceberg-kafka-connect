@@ -366,8 +366,16 @@ A partial equality delete matches all rows with those remaining values, as speci
 Iceberg; it does not distinguish rows by the disappeared columns. A null struct remains
 distinct from a non-null struct whose selected children are null.
 
-Adding ordinary fields, dropping all equality fields, and dropping a partition source
-field still fail schema preflight. Partition sources from historical specs are protected
+Ordinary source fields can also be added when the source schema has no default for them.
+Rows written before the ADD read the new column as null in Iceberg, which is what the
+source before images carry for them, so equality deletes still match; pending rows are
+re-keyed with null for the new column. A field added with a default (Debezium propagates
+column defaults into the Connect schema) fails schema preflight: the source reports the
+default for existing rows while Iceberg keeps null, so their deletes would not match.
+Backfill those rows in Iceberg manually before resuming.
+
+Dropping all equality fields and dropping a partition source field still fail schema
+preflight. Partition sources from historical specs are protected
 too. Append-only tables are exempt. Schema preflight requires schemaful records;
 schemaless Map records retain their inference/conversion path, but their deletes also
 preserve the difference between absent fields and explicit nulls. Identifier-field

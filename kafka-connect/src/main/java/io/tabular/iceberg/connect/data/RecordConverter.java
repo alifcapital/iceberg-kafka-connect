@@ -81,6 +81,7 @@ public class RecordConverter {
           .appendOffset("+HHmm", "Z")
           .toFormatter();
 
+  private final String tableName;
   private final Schema tableSchema;
   private final Set<Integer> partitionSourceIds = Sets.newHashSet();
   private final Map<org.apache.kafka.connect.data.Schema, Set<Integer>> sourceFieldIds =
@@ -96,6 +97,7 @@ public class RecordConverter {
   }
 
   public RecordConverter(Table table, IcebergSinkConfig config, boolean writeBeforeImageToIceberg) {
+    this.tableName = table.name();
     this.tableSchema = table.schema();
     if (table.specs() != null) {
       table
@@ -244,8 +246,19 @@ public class RecordConverter {
       boolean protectedShape = cdcWithoutKey && !name.equals("_cdc") && !name.startsWith("_cdc_");
       NestedField existing = lookupStructField(name, target, parentId);
       if (existing == null) {
-        if (protectedShape) {
-          throw new ConnectException("Cannot ADD " + path + " in CDC without a primary key");
+        // Rows written before ADD read as null in Iceberg. Without a default the source agrees,
+        // so before images still match them; a source default would not.
+        Object defaultValue = field.schema().defaultValue();
+        if (protectedShape && defaultValue != null) {
+          throw new ConnectException(
+              "Cannot ADD "
+                  + path
+                  + " with default "
+                  + defaultValue
+                  + " to table "
+                  + tableName
+                  + " in CDC without a primary key: existing Iceberg rows would keep null"
+                  + " while source rows have the default, backfill them manually");
         }
         updates.addColumn(parentPath, name, SchemaUtils.toIcebergType(field.schema(), config));
       } else {
