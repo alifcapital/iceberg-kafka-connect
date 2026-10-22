@@ -71,6 +71,7 @@ class SchemaEvolutionTest {
   private RecordConverter converter(org.apache.iceberg.Schema schema, IcebergSinkConfig config) {
     Table table = mock(Table.class);
     when(table.schema()).thenReturn(schema);
+    when(table.name()).thenReturn("iceberg.db.test");
     return new RecordConverter(table, config);
   }
 
@@ -427,5 +428,127 @@ class SchemaEvolutionTest {
     } finally {
       writer.close();
     }
+  }
+
+  @Test
+  void columnMissingFromSourceIsMarkedDroppedAndRestored() {
+    org.apache.iceberg.Schema schema =
+        new org.apache.iceberg.Schema(
+            Types.NestedField.optional(1, "x", Types.IntegerType.get()),
+            Types.NestedField.optional(2, "gone", Types.StringType.get()));
+    assertThat(converter(schema, config()).planSchema(row(Schema.OPTIONAL_INT32_SCHEMA), false).sourceDrops())
+        .extracting(SchemaUpdate.SourceDrop::name, SchemaUpdate.SourceDrop::dropped)
+        .containsExactly(org.assertj.core.groups.Tuple.tuple("gone", true));
+
+    org.apache.iceberg.Schema marked =
+        new org.apache.iceberg.Schema(
+            Types.NestedField.optional(1, "x", Types.IntegerType.get()),
+            Types.NestedField.optional(2, "gone", Types.StringType.get(), "[dropped in source 2026-10-22T12:00:00Z]"));
+    RecordConverter markedConverter = converter(marked, config());
+    assertThat(markedConverter.planSchema(row(Schema.OPTIONAL_INT32_SCHEMA), false).empty()).isTrue();
+    assertThat(
+            markedConverter
+                .planSchema(
+                    SchemaBuilder.struct()
+                        .field("x", Schema.OPTIONAL_INT32_SCHEMA)
+                        .field("gone", Schema.OPTIONAL_STRING_SCHEMA)
+                        .build(),
+                    false)
+                .sourceDrops())
+        .extracting(SchemaUpdate.SourceDrop::name, SchemaUpdate.SourceDrop::dropped)
+        .containsExactly(org.assertj.core.groups.Tuple.tuple("gone", false));
+  }
+
+  @Test
+  void columnBackInSourceStopsNoPkCdcTable() {
+    org.apache.iceberg.Schema marked =
+        new org.apache.iceberg.Schema(
+            Types.NestedField.optional(1, "x", Types.IntegerType.get()),
+            Types.NestedField.optional(
+                2,
+                "gone",
+                Types.StringType.get(),
+                "[dropped in source 2026-10-22T12:00:00Z] Loan's amount"));
+    Schema back =
+        SchemaBuilder.struct()
+            .field("x", Schema.OPTIONAL_INT32_SCHEMA)
+            .field("gone", Schema.OPTIONAL_STRING_SCHEMA)
+            .build();
+
+    assertThatThrownBy(() -> converter(marked, config()).planSchema(back, true))
+        .hasMessageContaining("Column gone of table db.test came back in the source")
+        .hasMessageContaining("UPDATE glue.db.test SET gone = NULL WHERE gone IS NOT NULL;")
+        .hasMessageContaining("ALTER TABLE glue.db.test ALTER COLUMN gone COMMENT '[restored in source ")
+        .hasMessageContaining("] Loan''s amount';");
+    // with a primary key the column simply comes back
+    assertThat(converter(marked, config()).planSchema(back, false).sourceDrops())
+        .extracting(SchemaUpdate.SourceDrop::name)
+        .containsExactly("gone");
+  }
+
+  @Test
+  void nestedFieldMissingFromSourceIsNotMarked() {
+    org.apache.iceberg.Schema schema =
+        new org.apache.iceberg.Schema(
+            Types.NestedField.optional(1, "x", Types.IntegerType.get()),
+            Types.NestedField.optional(
+                2,
+                "_cdc_before_image",
+                Types.StructType.of(
+                    Types.NestedField.optional(3, "x", Types.IntegerType.get()),
+                    Types.NestedField.optional(4, "y", Types.StringType.get()))),
+            Types.NestedField.optional(
+                5,
+                "payload",
+                Types.StructType.of(
+                    Types.NestedField.optional(6, "a", Types.IntegerType.get()),
+                    Types.NestedField.optional(7, "b", Types.StringType.get()))));
+    Schema source =
+        SchemaBuilder.struct()
+            .field("x", Schema.OPTIONAL_INT32_SCHEMA)
+            .field(
+                "_before_image",
+                SchemaBuilder.struct().field("x", Schema.OPTIONAL_INT32_SCHEMA).optional().build())
+            .field(
+                "payload",
+                SchemaBuilder.struct().field("a", Schema.OPTIONAL_INT32_SCHEMA).optional().build())
+            .build();
+    assertThat(converter(schema, config()).planSchema(source, false).sourceDrops()).isEmpty();
+  }
+
+  @Test
+  void sourceDropMarkerCreatesNewSchemaVersions() {
+    Table table =
+        table(
+            new org.apache.iceberg.Schema(
+                Types.NestedField.optional(1, "x", Types.IntegerType.get()),
+                Types.NestedField.optional(2, "gone", Types.StringType.get(), "Loan amount")));
+    int initial = table.schema().schemaId();
+
+    SchemaUpdate.Consumer drop = new SchemaUpdate.Consumer();
+    drop.markDropped("gone");
+    SchemaUtils.applySchemaUpdates(table, drop);
+    int dropped = table.schema().schemaId();
+    assertThat(dropped).isGreaterThan(initial);
+    assertThat(SourceDropMarker.isDropped(table.schema().findField("gone").doc())).isTrue();
+    assertThat(table.schema().findField("gone").doc()).endsWith("] Loan amount");
+
+    // repeated mark is a no-op: no extra schema version
+    SchemaUtils.applySchemaUpdates(table, drop);
+    assertThat(table.schema().schemaId()).isEqualTo(dropped);
+
+    SchemaUpdate.Consumer restore = new SchemaUpdate.Consumer();
+    restore.markRestored("gone");
+    SchemaUtils.applySchemaUpdates(table, restore);
+    int restored = table.schema().schemaId();
+    assertThat(restored).isGreaterThan(dropped);
+    assertThat(SourceDropMarker.isDropped(table.schema().findField("gone").doc())).isFalse();
+    assertThat(table.schema().findField("gone").doc())
+        .startsWith("[restored in source ")
+        .endsWith("] Loan amount");
+
+    // dropping again must not reuse an earlier schema id
+    SchemaUtils.applySchemaUpdates(table, drop);
+    assertThat(table.schema().schemaId()).isGreaterThan(restored);
   }
 }

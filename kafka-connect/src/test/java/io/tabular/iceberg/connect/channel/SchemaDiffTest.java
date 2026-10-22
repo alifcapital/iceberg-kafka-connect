@@ -290,4 +290,48 @@ public class SchemaDiffTest {
     assertThat(cols.get(1).get("name").toString()).isEqualTo("email");
     assertThat(cols.get(1).get("required")).isEqualTo(false);
   }
+
+  @Test
+  public void columnDroppedInSourceIsDropColumn() {
+    Schema before =
+        new Schema(
+            Types.NestedField.required(1, "id", Types.LongType.get()),
+            Types.NestedField.optional(2, "email", Types.StringType.get()));
+    Schema after =
+        new Schema(
+            Types.NestedField.required(1, "id", Types.LongType.get()),
+            Types.NestedField.optional(2, "email", Types.StringType.get(), "[dropped in source 2026-10-22T12:00:00Z]"),
+            Types.NestedField.optional(3, "contact_email", Types.StringType.get()));
+
+    List<GenericRecord> changes = SchemaDiff.diff(before, after);
+    assertThat(changes).extracting(c -> c.get("op") + " " + c.get("name"))
+        .containsExactly("DROP_COLUMN email", "ADD_COLUMN contact_email");
+  }
+
+  @Test
+  public void droppedRequiredColumnIsOnlyDropColumn() {
+    Schema before = new Schema(Types.NestedField.required(2, "phone", Types.StringType.get()));
+    Schema after =
+        new Schema(
+            Types.NestedField.optional(2, "phone", Types.StringType.get(), "[dropped in source 2026-10-22T12:00:00Z]"));
+
+    List<GenericRecord> changes = SchemaDiff.diff(before, after);
+    assertThat(changes).extracting(c -> c.get("op").toString()).containsExactly("DROP_COLUMN");
+  }
+
+  @Test
+  public void columnRestoredInSourceIsAddColumn() {
+    Schema before =
+        new Schema(
+            Types.NestedField.optional(2, "email", Types.StringType.get(), "[dropped in source 2026-10-22T12:00:00Z]"));
+    Schema after =
+        new Schema(
+            Types.NestedField.optional(2, "email", Types.StringType.get(), "[restored in source 2026-10-22T13:00:00Z]"));
+
+    List<GenericRecord> changes = SchemaDiff.diff(before, after);
+    assertThat(changes).hasSize(1);
+    assertThat(changes.get(0).get("op")).isEqualTo(DdlEvent.OP_ADD_COLUMN);
+    assertThat(changes.get(0).get("name").toString()).isEqualTo("email");
+    assertThat(changes.get(0).get("type").toString()).isEqualTo("string");
+  }
 }

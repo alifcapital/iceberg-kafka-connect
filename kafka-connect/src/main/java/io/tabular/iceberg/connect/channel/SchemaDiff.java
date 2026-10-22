@@ -18,6 +18,7 @@
  */
 package io.tabular.iceberg.connect.channel;
 
+import io.tabular.iceberg.connect.data.SourceDropMarker;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
@@ -93,6 +94,34 @@ final class SchemaDiff {
               typeLabel(a.type()),
               null));
         }
+        // The column stays in Iceberg when it is dropped in the source; the sink records that
+        // in the column doc (see SourceDropMarker). Report it as the source change it stands for.
+        boolean droppedBefore = SourceDropMarker.isDropped(b.doc());
+        boolean droppedAfter = SourceDropMarker.isDropped(a.doc());
+        boolean droppedNow = !droppedBefore && droppedAfter;
+        if (droppedNow) {
+          changes.add(change(
+              DdlEvent.OP_DROP_COLUMN,
+              fid,
+              after.findColumnName(fid),
+              null,
+              null,
+              null,
+              null,
+              null,
+              null));
+        } else if (droppedBefore && !droppedAfter) {
+          changes.add(change(
+              DdlEvent.OP_ADD_COLUMN,
+              fid,
+              after.findColumnName(fid),
+              null,
+              null,
+              typeLabel(a.type()),
+              null,
+              null,
+              !a.isOptional()));
+        }
         if (b.isOptional() && !a.isOptional()) {
           changes.add(change(
               DdlEvent.OP_REQUIRE_COLUMN,
@@ -104,7 +133,8 @@ final class SchemaDiff {
               null,
               null,
               null));
-        } else if (!b.isOptional() && a.isOptional()) {
+        } else if (!b.isOptional() && a.isOptional() && !droppedNow) {
+          // a dropped required column is also made optional; DROP_COLUMN already says it all
           changes.add(change(
               DdlEvent.OP_MAKE_OPTIONAL,
               fid,
