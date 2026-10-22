@@ -23,8 +23,10 @@ import static java.util.stream.Collectors.toList;
 import io.tabular.iceberg.connect.IcebergSinkConfig;
 import io.tabular.iceberg.connect.data.SchemaUpdate.AddColumn;
 import io.tabular.iceberg.connect.data.SchemaUpdate.MakeOptional;
+import io.tabular.iceberg.connect.data.SchemaUpdate.SourceDrop;
 import io.tabular.iceberg.connect.data.SchemaUpdate.UpdateType;
 import java.math.BigDecimal;
+import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
@@ -115,7 +117,16 @@ public class SchemaUtils {
             .filter(makeOptional -> !isOptional(table.schema(), makeOptional))
             .collect(toList());
 
-    if (addColumns.isEmpty() && updateTypes.isEmpty() && makeOptionals.isEmpty()) {
+    // filter out columns whose source-drop marker is already in the wanted state
+    List<SourceDrop> sourceDrops =
+        updates.sourceDrops().stream()
+            .filter(mark -> mark.dropped() != isMarkedDropped(table.schema(), mark.name()))
+            .collect(toList());
+
+    if (addColumns.isEmpty()
+        && updateTypes.isEmpty()
+        && makeOptionals.isEmpty()
+        && sourceDrops.isEmpty()) {
       // no updates to apply
       LOG.info("Schema for table {} already up-to-date", table.name());
       return;
@@ -127,7 +138,25 @@ public class SchemaUtils {
         update -> updateSchema.addColumn(update.parentName(), update.name(), update.type()));
     updateTypes.forEach(update -> updateSchema.updateColumn(update.name(), update.type()));
     makeOptionals.forEach(update -> updateSchema.makeColumnOptional(update.name()));
+    Instant now = Instant.now();
+    org.apache.iceberg.Schema current = table.schema();
+    sourceDrops.forEach(
+        mark -> {
+          String doc = current.findField(mark.name()).doc();
+          updateSchema.updateColumnDoc(
+              mark.name(),
+              mark.dropped()
+                  ? SourceDropMarker.droppedDoc(now, doc)
+                  : SourceDropMarker.restoredDoc(now, doc));
+        });
     updateSchema.commit();
+    if (!sourceDrops.isEmpty()) {
+      LOG.info(
+          "Table {}: columns dropped in source {}, back in source {}",
+          table.name(),
+          sourceDrops.stream().filter(SourceDrop::dropped).map(SourceDrop::name).collect(toList()),
+          sourceDrops.stream().filter(m -> !m.dropped()).map(SourceDrop::name).collect(toList()));
+    }
     LOG.info("Schema for table {} updated with new columns", table.name());
   }
 
@@ -145,6 +174,11 @@ public class SchemaUtils {
 
   private static boolean isOptional(org.apache.iceberg.Schema schema, MakeOptional update) {
     return schema.findField(update.name()).isOptional();
+  }
+
+  private static boolean isMarkedDropped(org.apache.iceberg.Schema schema, String name) {
+    NestedField field = schema.findField(name);
+    return field != null && SourceDropMarker.isDropped(field.doc());
   }
 
   public static PartitionSpec createPartitionSpec(

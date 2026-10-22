@@ -265,6 +265,15 @@ public class RecordConverter {
         present.add(existing.fieldId());
         String actualPath = tableSchema.findColumnName(existing.fieldId());
         planField(field.schema(), existing, actualPath, protectedShape, updates);
+        if (parentPath == null && SourceDropMarker.isDropped(existing.doc())) {
+          if (protectedShape) {
+            // Rows written before the drop still hold the old values in Iceberg, while the source
+            // now has null or the column default: before images would stop matching them.
+            throw new ConnectException(
+                columnBackInNoPkTable(actualPath, existing.doc(), field.schema().defaultValue()));
+          }
+          updates.markRestored(actualPath);
+        }
       }
     }
     for (NestedField existing : target.fields()) {
@@ -283,8 +292,48 @@ public class RecordConverter {
         if (existing.isRequired()) {
           updates.makeOptional(path);
         }
+        // Only top-level columns: nested structs such as _cdc_before_image legitimately carry a
+        // subset of fields (e.g. only key columns with REPLICA IDENTITY DEFAULT).
+        if (parentPath == null && !SourceDropMarker.isDropped(existing.doc())) {
+          updates.markDropped(path);
+        }
       }
     }
+  }
+
+  /** Error text with ready-to-run Spark commands to bring the column in line with the source. */
+  private String columnBackInNoPkTable(String column, String doc, Object defaultValue) {
+    String[] parts = tableName == null ? new String[0] : tableName.split("\\.");
+    String dbTable =
+        parts.length >= 2 ? parts[parts.length - 2] + "." + parts[parts.length - 1] : tableName;
+    String sparkTable = "glue." + dbTable;
+    String comment =
+        SourceDropMarker.restoredDoc(java.time.Instant.now(), doc).replace("'", "''");
+    String value = defaultValue == null ? "NULL" : "NULL /* or the column default: " + defaultValue + " */";
+    return "Column "
+        + column
+        + " of table "
+        + dbTable
+        + " came back in the source, but the table has no primary key.\n"
+        + "Old values in Iceberg do not match the source, so deletes and updates would stop"
+        + " matching.\n"
+        + "Fix it in Spark, then restart the task:\n"
+        + "  UPDATE "
+        + sparkTable
+        + " SET "
+        + column
+        + " = "
+        + value
+        + " WHERE "
+        + column
+        + " IS NOT NULL;\n"
+        + "  ALTER TABLE "
+        + sparkTable
+        + " ALTER COLUMN "
+        + column
+        + " COMMENT '"
+        + comment
+        + "';";
   }
 
   private boolean containsIdentifier(Type type, int fieldId) {

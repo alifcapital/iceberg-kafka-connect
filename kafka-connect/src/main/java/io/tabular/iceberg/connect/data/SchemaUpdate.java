@@ -30,6 +30,7 @@ public class SchemaUpdate {
     private final Map<String, AddColumn> addColumns = Maps.newHashMap();
     private final Map<String, UpdateType> updateTypes = Maps.newHashMap();
     private final Map<String, MakeOptional> makeOptionals = Maps.newHashMap();
+    private final Map<String, SourceDrop> sourceDrops = Maps.newHashMap();
 
     public Collection<AddColumn> addColumns() {
       return addColumns.values();
@@ -43,8 +44,15 @@ public class SchemaUpdate {
       return makeOptionals.values();
     }
 
+    public Collection<SourceDrop> sourceDrops() {
+      return sourceDrops.values();
+    }
+
     public boolean empty() {
-      return addColumns.isEmpty() && updateTypes.isEmpty() && makeOptionals.isEmpty();
+      return addColumns.isEmpty()
+          && updateTypes.isEmpty()
+          && makeOptionals.isEmpty()
+          && sourceDrops.isEmpty();
     }
 
     public void addColumn(String parentName, String name, Type type) {
@@ -58,6 +66,16 @@ public class SchemaUpdate {
 
     public void makeOptional(String name) {
       makeOptionals.put(name, new MakeOptional(name));
+    }
+
+    /** Column is in the table but missing from source records: it was dropped in the source. */
+    public void markDropped(String name) {
+      sourceDrops.put(name, new SourceDrop(name, true));
+    }
+
+    /** Column marked as dropped is present in source records again. */
+    public void markRestored(String name) {
+      sourceDrops.put(name, new SourceDrop(name, false));
     }
   }
 
@@ -116,6 +134,25 @@ public class SchemaUpdate {
 
     public String name() {
       return name;
+    }
+  }
+
+  /** Sets (dropped=true) or clears (dropped=false) the dropped-in-source marker of a column. */
+  public static class SourceDrop extends SchemaUpdate {
+    private final String name;
+    private final boolean dropped;
+
+    public SourceDrop(String name, boolean dropped) {
+      this.name = name;
+      this.dropped = dropped;
+    }
+
+    public String name() {
+      return name;
+    }
+
+    public boolean dropped() {
+      return dropped;
     }
   }
 }
