@@ -487,6 +487,28 @@ class SchemaEvolutionTest {
   }
 
   @Test
+  void legacyBeforeImageColumnIsNotMarkedDropped() {
+    org.apache.iceberg.Schema schema =
+        new org.apache.iceberg.Schema(
+            Types.NestedField.optional(1, "x", Types.IntegerType.get()),
+            Types.NestedField.optional(
+                2,
+                "_before_image",
+                Types.StructType.of(Types.NestedField.optional(3, "x", Types.IntegerType.get()))));
+    Schema source =
+        SchemaBuilder.struct()
+            .field("x", Schema.OPTIONAL_INT32_SCHEMA)
+            .field(
+                "_before_image",
+                SchemaBuilder.struct().field("x", Schema.OPTIONAL_INT32_SCHEMA).optional().build())
+            .build();
+
+    assertThat(converter(schema, config()).planSchema(source, false).sourceDrops()).isEmpty();
+    assertThat(converter(schema, config()).planSchema(row(Schema.OPTIONAL_INT32_SCHEMA), false).sourceDrops())
+        .isEmpty();
+  }
+
+  @Test
   void nestedFieldMissingFromSourceIsNotMarked() {
     org.apache.iceberg.Schema schema =
         new org.apache.iceberg.Schema(
