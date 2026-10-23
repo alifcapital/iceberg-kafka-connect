@@ -294,7 +294,11 @@ public class RecordConverter {
         }
         // Only top-level columns: nested structs such as _cdc_before_image legitimately carry a
         // subset of fields (e.g. only key columns with REPLICA IDENTITY DEFAULT).
-        if (parentPath == null && !SourceDropMarker.isDropped(existing.doc())) {
+        // _before_image: legacy name of the before-image column; the source field of that name
+        // is renamed or skipped above, so the table column is never "present" here.
+        if (parentPath == null
+            && !existing.name().equals("_before_image")
+            && !SourceDropMarker.isDropped(existing.doc())) {
           updates.markDropped(path);
         }
       }
