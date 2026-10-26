@@ -23,4 +23,10 @@ import org.apache.kafka.connect.sink.SinkRecord;
 
 interface Writer extends CommittableSupplier {
   void write(Collection<SinkRecord> sinkRecords);
+
+  /** Conversion failure that stopped writing, or null. Records before it remain committable. */
+  RuntimeException deferredFailure();
+
+  /** Whether any record was consumed since the last committable. */
+  boolean madeProgress();
 }

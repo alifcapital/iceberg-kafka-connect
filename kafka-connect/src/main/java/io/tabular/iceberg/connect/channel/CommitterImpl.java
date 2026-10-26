@@ -38,6 +38,7 @@ import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.connect.events.CommitComplete;
 import org.apache.iceberg.connect.events.DataComplete;
 import org.apache.iceberg.connect.events.DataWritten;
 import org.apache.iceberg.connect.events.Event;
@@ -64,6 +65,8 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
   private final SinkTaskContext context;
   private final IcebergSinkConfig config;
   private final Optional<CoordinatorThread> maybeCoordinatorThread;
+  private UUID lastResponseCommitId;
+  private UUID lastCompleteCommitId;
 
   public CommitterImpl(SinkTaskContext context, IcebergSinkConfig config, Catalog catalog) {
     this(context, config, catalog, new KafkaClientFactory(config.kafkaProps()));
@@ -136,9 +139,17 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
   }
 
   private boolean receive(Envelope envelope, CommittableSupplier committableSupplier) {
-    if (!envelope.isLocalEvent() && envelope.event().type() == PayloadType.START_COMMIT) {
+    if (envelope.isLocalEvent()) {
+      return false;
+    }
+    if (envelope.event().type() == PayloadType.START_COMMIT) {
       UUID commitId = ((StartCommit) envelope.event().payload()).commitId();
       sendCommitResponse(commitId, committableSupplier);
+      lastResponseCommitId = commitId;
+      return true;
+    }
+    if (envelope.event().type() == PayloadType.COMMIT_COMPLETE) {
+      lastCompleteCommitId = ((CommitComplete) envelope.event().payload()).commitId();
       return true;
     }
     return false;
@@ -233,6 +244,16 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
   public void commit(CommittableSupplier committableSupplier) {
     throwExceptionIfCoordinatorIsTerminated();
     consumeAvailable(Duration.ZERO, envelope -> receive(envelope, committableSupplier));
+  }
+
+  @Override
+  public UUID lastResponseCommitId() {
+    return lastResponseCommitId;
+  }
+
+  @Override
+  public boolean isCommitComplete(UUID commitId) {
+    return commitId != null && commitId.equals(lastCompleteCommitId);
   }
 
   @Override

@@ -573,4 +573,33 @@ class SchemaEvolutionTest {
     SchemaUtils.applySchemaUpdates(table, drop);
     assertThat(table.schema().schemaId()).isGreaterThan(restored);
   }
+
+  @Test
+  void incompatibleTypeKeepsRecordsWrittenBeforeIt() {
+    Table table = table(one(Types.LongType.get()));
+    IcebergWriter writer = new IcebergWriter(table, "db.test", config(), true);
+    Schema asLong = SchemaBuilder.struct().field("x", Schema.INT64_SCHEMA).build();
+    Schema asString = SchemaBuilder.struct().field("x", Schema.STRING_SCHEMA).build();
+    try {
+      writer.write(
+          new SinkRecord("source", 0, null, null, asLong, new Struct(asLong).put("x", 1L), 41));
+      Struct phone = new Struct(asString).put("x", "+992900000000");
+      assertThatThrownBy(
+              () -> writer.write(new SinkRecord("source", 0, null, null, asString, phone, 42)))
+          .isInstanceOf(RecordConversionException.class);
+
+      // the record written before the failure is still committable
+      WriteComplete result = writer.complete();
+      long rows =
+          result.writerResults().stream()
+              .flatMap(r -> r.dataFiles().stream())
+              .mapToLong(f -> f.recordCount())
+              .sum();
+      assertThat(rows).isEqualTo(1L);
+      assertThat(result.dataOffsets().values())
+          .allSatisfy(offset -> assertThat(offset.offset()).isEqualTo(41L));
+    } finally {
+      writer.close();
+    }
+  }
 }
