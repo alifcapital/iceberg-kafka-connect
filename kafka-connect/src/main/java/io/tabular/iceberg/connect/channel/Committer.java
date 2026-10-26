@@ -18,6 +18,14 @@
  */
 package io.tabular.iceberg.connect.channel;
 
+import java.util.UUID;
+
 interface Committer {
   void commit(CommittableSupplier committableSupplier);
+
+  /** Id of the last commit this task responded to, or null. */
+  UUID lastResponseCommitId();
+
+  /** Whether the coordinator reported the commit as complete. */
+  boolean isCommitComplete(UUID commitId);
 }

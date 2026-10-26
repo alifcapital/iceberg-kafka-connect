@@ -91,26 +91,74 @@ public class IcebergWriter implements RecordWriter {
 
   @Override
   public void write(SinkRecord record) {
+    // TODO: config to handle tombstones instead of always ignoring?
+    if (record.value() == null) {
+      return;
+    }
+    String cdcField = config.tablesCdcField();
+    Record row;
+    Operation op = null;
+    Record before = null;
     try {
-      // TODO: config to handle tombstones instead of always ignoring?
-      if (record.value() != null) {
-        Record row = convertToRow(record);
-        String cdcField = config.tablesCdcField();
-        if (cdcField == null) {
-          writer.write(row);
-        } else {
-          Operation op = extractCdcOperation(record.value(), cdcField);
-          Record before = extractBeforeImage(record.value());
-          writer.write(new RecordWrapper(row, op, before));
-        }
-        trackDataOffset(record);
+      row = convertToRow(record);
+      if (cdcField != null) {
+        op = extractCdcOperation(record.value(), cdcField);
+        before = extractBeforeImage(record.value());
       }
+    } catch (WriterStateException e) {
+      throw new DataException(errorMessage(record), e.getCause());
     } catch (Exception e) {
-      throw new DataException(
-          String.format(
-              "An error occurred converting record, topic: %s, partition, %d, offset: %d",
-              record.topic(), record.kafkaPartition(), record.kafkaOffset()),
-          e);
+      throw new RecordConversionException(errorMessage(record), e);
+    }
+    try {
+      if (cdcField == null) {
+        writer.write(row);
+      } else {
+        writer.write(new RecordWrapper(row, op, before));
+      }
+      trackDataOffset(record);
+    } catch (Exception e) {
+      throw new DataException(errorMessage(record), e);
+    }
+  }
+
+  private static String errorMessage(SinkRecord record) {
+    return String.format(
+        "An error occurred converting record, topic: %s, partition, %d, offset: %d",
+        record.topic(), record.kafkaPartition(), record.kafkaOffset());
+  }
+
+  /** Completing or reopening the task writer failed, so its state is unknown. */
+  private static class WriterStateException extends RuntimeException {
+    WriterStateException(Throwable cause) {
+      super(cause);
+    }
+  }
+
+  // Completes the current file, runs the schema change and opens a writer for the resulting table
+  // schema. A failed schema change still leaves a consistent writer behind.
+  private void reopenWriter(Runnable schemaChange) {
+    try {
+      flush();
+    } catch (RuntimeException e) {
+      throw new WriterStateException(e);
+    }
+    RuntimeException schemaChangeFailure = null;
+    try {
+      schemaChange.run();
+    } catch (RuntimeException e) {
+      schemaChangeFailure = e;
+    }
+    try {
+      initNewWriter();
+    } catch (RuntimeException e) {
+      if (schemaChangeFailure != null) {
+        e.addSuppressed(schemaChangeFailure);
+      }
+      throw new WriterStateException(e);
+    }
+    if (schemaChangeFailure != null) {
+      throw schemaChangeFailure;
     }
   }
 
@@ -129,8 +177,7 @@ public class IcebergWriter implements RecordWriter {
   private Record convertToRow(SinkRecord record) {
     // Table metadata can also be refreshed by another owner of the Table instance.
     if (validatedTableSchemaId != table.schema().schemaId()) {
-      flush();
-      initNewWriter();
+      reopenWriter(() -> {});
     }
     validateKey(record.keySchema());
     if (record.valueSchema() != null) {
@@ -145,9 +192,7 @@ public class IcebergWriter implements RecordWriter {
           if (!config.evolveSchemaEnabled()) {
             throw new DataException("Schema evolution is disabled for table " + tableName);
           }
-          flush();
-          SchemaUtils.applySchemaUpdates(table, planned);
-          initNewWriter();
+          reopenWriter(() -> SchemaUtils.applySchemaUpdates(table, planned));
           // Recheck refreshed metadata, including changes committed by other writers.
           if (!recordConverter.planSchema(record.valueSchema(), cdcWithoutKey).empty()) {
             throw new DataException(
@@ -169,13 +214,10 @@ public class IcebergWriter implements RecordWriter {
     Record row = recordConverter.convert(record.value(), updates);
 
     if (!updates.empty()) {
-      // complete the current file
-      flush();
-      // apply the schema updates, this will refresh the table
-      SchemaUtils.applySchemaUpdates(table, updates);
+      // complete the current file, apply the schema updates (this will refresh the table)
+      // and initialize a new writer with the new schema
+      reopenWriter(() -> SchemaUtils.applySchemaUpdates(table, updates));
       LOG.info("Table schema evolution on table {} caused by record at topic: {}, partition: {}, offset: {}", table.name(), record.topic(), record.kafkaPartition(), record.kafkaOffset());
-      // initialize a new writer with the new schema
-      initNewWriter();
       // convert the row again, this time using the new table schema
       row = recordConverter.convert(record.value(), null);
     }

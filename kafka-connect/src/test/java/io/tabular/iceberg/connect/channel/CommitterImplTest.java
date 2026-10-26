@@ -479,6 +479,45 @@ class CommitterImplTest {
   }
 
   @Test
+  public void testCommitTracksCompletionOfRespondedCommit() throws IOException {
+    whenAdminListConsumerGroupOffsetsThenReturn(
+        ImmutableMap.of(CONFIG.controlGroupId(), ImmutableMap.of(SOURCE_TP0, 100L)));
+    UUID commitId = UUID.randomUUID();
+
+    try (CommitterImpl committer =
+        new CommitterImpl(
+            mockContext(), CONFIG, kafkaClientFactory, new NoOpCoordinatorThreadFactory())) {
+      initConsumer();
+      assertThat(committer.lastResponseCommitId()).isNull();
+
+      consumer.addRecord(
+          new ConsumerRecord<>(
+              CONTROL_TOPIC_PARTITION.topic(),
+              CONTROL_TOPIC_PARTITION.partition(),
+              0,
+              UUID.randomUUID().toString(),
+              AvroUtil.encode(new Event(CONFIG.controlGroupId(), new StartCommit(commitId)))));
+      committer.commit(
+          () -> new Committable(ImmutableMap.of(), ImmutableList.of(), ImmutableMap.of()));
+      assertThat(committer.lastResponseCommitId()).isEqualTo(commitId);
+      assertThat(committer.isCommitComplete(commitId)).isFalse();
+
+      consumer.addRecord(
+          new ConsumerRecord<>(
+              CONTROL_TOPIC_PARTITION.topic(),
+              CONTROL_TOPIC_PARTITION.partition(),
+              1,
+              UUID.randomUUID().toString(),
+              AvroUtil.encode(
+                  new Event(CONFIG.controlGroupId(), new CommitComplete(commitId, null)))));
+      committer.commit(
+          () -> new Committable(ImmutableMap.of(), ImmutableList.of(), ImmutableMap.of()));
+      assertThat(committer.isCommitComplete(commitId)).isTrue();
+      assertThat(committer.isCommitComplete(UUID.randomUUID())).isFalse();
+    }
+  }
+
+  @Test
   public void testCommitWhenCommittableIsEmpty() throws IOException {
     SinkTaskContext mockContext = mockContext();
 

@@ -23,6 +23,7 @@ import static java.util.stream.Collectors.toList;
 import io.tabular.iceberg.connect.IcebergSinkConfig;
 import io.tabular.iceberg.connect.data.IcebergWriterFactory;
 import io.tabular.iceberg.connect.data.Offset;
+import io.tabular.iceberg.connect.data.RecordConversionException;
 import io.tabular.iceberg.connect.data.RecordWriter;
 import io.tabular.iceberg.connect.data.Utilities;
 import io.tabular.iceberg.connect.data.WriteComplete;
@@ -49,6 +50,9 @@ class Worker implements Writer, AutoCloseable {
   private final IcebergWriterFactory writerFactory;
   private final Map<String, RecordWriter> writers;
   private final Map<TopicPartition, Offset> dataOffsets;
+  private RecordConversionException deferredFailure;
+  private boolean madeProgress;
+  private int tablesWrittenForRecord;
 
   Worker(IcebergSinkConfig config, Catalog catalog) {
     this(config, new IcebergWriterFactory(catalog, config));
@@ -86,6 +90,7 @@ class Worker implements Writer, AutoCloseable {
 
     writers.clear();
     dataOffsets.clear();
+    madeProgress = false;
 
     return new Committable(offsets, writeResults, dataOffsetsByTable);
   }
@@ -99,23 +104,52 @@ class Worker implements Writer, AutoCloseable {
 
   @Override
   public void write(Collection<SinkRecord> sinkRecords) {
-    if (sinkRecords != null && !sinkRecords.isEmpty()) {
-      sinkRecords.forEach(this::save);
+    if (sinkRecords == null) {
+      return;
+    }
+    for (SinkRecord record : sinkRecords) {
+      if (deferredFailure != null) {
+        // the failed record and everything after it is consumed again after the restart
+        return;
+      }
+      save(record);
     }
   }
 
+  @Override
+  public RuntimeException deferredFailure() {
+    return deferredFailure;
+  }
+
+  @Override
+  public boolean madeProgress() {
+    return madeProgress;
+  }
+
   private void save(SinkRecord record) {
+    TopicPartition topicPartition = new TopicPartition(record.topic(), record.kafkaPartition());
+    tablesWrittenForRecord = 0;
+    try {
+      if (config.dynamicTablesEnabled()) {
+        routeRecordDynamically(record);
+      } else {
+        routeRecordStatically(record);
+      }
+    } catch (RecordConversionException e) {
+      if (tablesWrittenForRecord > 0) {
+        // the record is already in another table, consuming it again would duplicate it there
+        throw e;
+      }
+      deferredFailure = e;
+      // the failed record is the next one to consume, so it is retried after the restart
+      dataOffsets.put(topicPartition, new Offset(record.kafkaOffset(), record.timestamp()));
+      return;
+    }
+
     // the consumer stores the offsets that corresponds to the next record to consume,
     // so increment the record offset by one
-    dataOffsets.put(
-        new TopicPartition(record.topic(), record.kafkaPartition()),
-        new Offset(record.kafkaOffset() + 1, record.timestamp()));
-
-    if (config.dynamicTablesEnabled()) {
-      routeRecordDynamically(record);
-    } else {
-      routeRecordStatically(record);
-    }
+    dataOffsets.put(topicPartition, new Offset(record.kafkaOffset() + 1, record.timestamp()));
+    madeProgress = true;
   }
 
   private void routeRecordStatically(SinkRecord record) {
@@ -127,7 +161,7 @@ class Worker implements Writer, AutoCloseable {
           .tables()
           .forEach(
               tableName -> {
-                writerForTable(tableName, record, false).write(record);
+                writeToTable(tableName, record, false);
               });
 
     } else {
@@ -143,7 +177,7 @@ class Worker implements Writer, AutoCloseable {
                         .ifPresent(
                             regex -> {
                               if (regex.matcher(routeValue).matches()) {
-                                writerForTable(tableName, record, false).write(record);
+                                writeToTable(tableName, record, false);
                               }
                             }));
       }
@@ -157,7 +191,7 @@ class Worker implements Writer, AutoCloseable {
     String routeValue = extractRouteValue(record.value(), routeField);
     if (routeValue != null) {
       String tableName = routeValue.toLowerCase();
-      writerForTable(tableName, record, true).write(record);
+      writeToTable(tableName, record, true);
     }
   }
 
@@ -167,6 +201,11 @@ class Worker implements Writer, AutoCloseable {
     }
     Object routeValue = Utilities.extractFromRecordValue(recordValue, routeField);
     return routeValue == null ? null : routeValue.toString();
+  }
+
+  private void writeToTable(String tableName, SinkRecord record, boolean ignoreMissingTable) {
+    writerForTable(tableName, record, ignoreMissingTable).write(record);
+    tablesWrittenForRecord++;
   }
 
   private RecordWriter writerForTable(
