@@ -28,6 +28,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Pattern;
 import org.apache.iceberg.IcebergBuild;
 import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
@@ -288,12 +289,37 @@ public class IcebergSinkConfig extends AbstractConfig {
   private final Map<String, String> kafkaProps;
   private final Map<String, String> autoCreateProps;
   private final Map<String, String> writeProps;
-  private final Map<String, TableSinkConfig> tableConfigMap = Maps.newHashMap();
+  private final Map<String, TableSinkConfig> tableConfigMap = new ConcurrentHashMap<>();
   private final JsonConverter jsonConverter;
+
+  // The settings read for every record, taken once: AbstractConfig looks a value up by name in a
+  // map on each call, and the values cannot change once the config is built. The flags stay
+  // boxed, as AbstractConfig returns them, so that a missing value still fails when it is used.
+  private final List<String> tables;
+  private final Boolean dynamicTablesEnabled;
+  private final String tablesRouteField;
+  private final String tablesCdcField;
+  private final Boolean upsertModeEnabled;
+  private final Boolean evolveSchemaEnabled;
+  private final Boolean schemaVariableDecimalAsString;
+  private final Boolean schemaForceOptional;
+  private final Boolean schemaCaseInsensitive;
+  private final Boolean schemaDebeziumTimeTypes;
 
   public IcebergSinkConfig(Map<String, String> originalProps) {
     super(CONFIG_DEF, originalProps);
     this.originalProps = originalProps;
+
+    this.tables = getList(TABLES_PROP);
+    this.dynamicTablesEnabled = getBoolean(TABLES_DYNAMIC_PROP);
+    this.tablesRouteField = getString(TABLES_ROUTE_FIELD_PROP);
+    this.tablesCdcField = getString(TABLES_CDC_FIELD_PROP);
+    this.upsertModeEnabled = getBoolean(TABLES_UPSERT_MODE_ENABLED_PROP);
+    this.evolveSchemaEnabled = getBoolean(TABLES_EVOLVE_SCHEMA_ENABLED_PROP);
+    this.schemaVariableDecimalAsString = getBoolean(TABLES_VARIABLE_DECIMAL_AS_STRING_PROP);
+    this.schemaForceOptional = getBoolean(TABLES_SCHEMA_FORCE_OPTIONAL_PROP);
+    this.schemaCaseInsensitive = getBoolean(TABLES_SCHEMA_CASE_INSENSITIVE_PROP);
+    this.schemaDebeziumTimeTypes = getBoolean(TABLES_SCHEMA_DEBEZIUM_TIME_TYPES_PROP);
 
     this.catalogProps = PropertyUtil.propertiesWithPrefix(originalProps, CATALOG_PROP_PREFIX);
     this.hadoopProps = PropertyUtil.propertiesWithPrefix(originalProps, HADOOP_PROP_PREFIX);
@@ -368,15 +394,15 @@ public class IcebergSinkConfig extends AbstractConfig {
   }
 
   public List<String> tables() {
-    return getList(TABLES_PROP);
+    return tables;
   }
 
   public boolean dynamicTablesEnabled() {
-    return getBoolean(TABLES_DYNAMIC_PROP);
+    return dynamicTablesEnabled;
   }
 
   public String tablesRouteField() {
-    return getString(TABLES_ROUTE_FIELD_PROP);
+    return tablesRouteField;
   }
 
   public String tablesDefaultCommitBranch() {
@@ -392,6 +418,11 @@ public class IcebergSinkConfig extends AbstractConfig {
   }
 
   public TableSinkConfig tableConfig(String tableName) {
+    // called for every record, so look it up before creating a lambda to compute it
+    TableSinkConfig existing = tableConfigMap.get(tableName);
+    if (existing != null) {
+      return existing;
+    }
     return tableConfigMap.computeIfAbsent(
         tableName,
         notUsed -> {
@@ -431,7 +462,7 @@ public class IcebergSinkConfig extends AbstractConfig {
   }
 
   public String tablesCdcField() {
-    return getString(TABLES_CDC_FIELD_PROP);
+    return tablesCdcField;
   }
 
   public String controlTopic() {
@@ -523,7 +554,7 @@ public class IcebergSinkConfig extends AbstractConfig {
   }
 
   public boolean upsertModeEnabled() {
-    return getBoolean(TABLES_UPSERT_MODE_ENABLED_PROP);
+    return upsertModeEnabled;
   }
 
   public boolean autoCreateEnabled() {
@@ -531,23 +562,23 @@ public class IcebergSinkConfig extends AbstractConfig {
   }
 
   public boolean evolveSchemaEnabled() {
-    return getBoolean(TABLES_EVOLVE_SCHEMA_ENABLED_PROP);
+    return evolveSchemaEnabled;
   }
 
   public boolean schemaVariableDecimalAsString() {
-    return getBoolean(TABLES_VARIABLE_DECIMAL_AS_STRING_PROP);
+    return schemaVariableDecimalAsString;
   }
 
   public boolean schemaForceOptional() {
-    return getBoolean(TABLES_SCHEMA_FORCE_OPTIONAL_PROP);
+    return schemaForceOptional;
   }
 
   public boolean schemaCaseInsensitive() {
-    return getBoolean(TABLES_SCHEMA_CASE_INSENSITIVE_PROP);
+    return schemaCaseInsensitive;
   }
 
   public boolean schemaDebeziumTimeTypes() {
-    return getBoolean(TABLES_SCHEMA_DEBEZIUM_TIME_TYPES_PROP);
+    return schemaDebeziumTimeTypes;
   }
 
   public JsonConverter jsonConverter() {
