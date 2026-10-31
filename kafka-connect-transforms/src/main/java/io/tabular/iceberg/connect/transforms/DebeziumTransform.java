@@ -18,11 +18,15 @@
  */
 package io.tabular.iceberg.connect.transforms;
 
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
+import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.kafka.common.config.ConfigDef;
 import org.apache.kafka.common.config.ConfigDef.Importance;
 import org.apache.kafka.connect.connector.ConnectRecord;
+import org.apache.kafka.connect.data.ConnectSchema;
 import org.apache.kafka.connect.data.Field;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
@@ -53,7 +57,13 @@ public class DebeziumTransform<R extends ConnectRecord<R>> implements Transforma
               Importance.MEDIUM,
               "Pattern to use for setting the CDC target field value.");
 
+  // The converter hands out the same Schema instance for every record of one Avro schema, so the
+  // schemas built from them are cached by instance. Bounded so that schema churn cannot leak.
+  private static final int SCHEMA_CACHE_SIZE = 1024;
+
   private String cdcTargetPattern;
+  private final SchemaCache cdcSchemas = new SchemaCache();
+  private final SchemaCache updatedSchemas = new SchemaCache();
 
   @Override
   public void configure(Map<String, ?> props) {
@@ -103,7 +113,7 @@ public class DebeziumTransform<R extends ConnectRecord<R>> implements Transforma
     }
 
     // create the CDC metadata
-    Schema cdcSchema = makeCdcSchema(record.keySchema());
+    Schema cdcSchema = cdcSchema(record.keySchema());
     Struct cdcMetadata = new Struct(cdcSchema);
     cdcMetadata.put(CdcConstants.COL_OP, op);
     cdcMetadata.put(CdcConstants.COL_TS, new java.util.Date(value.getStruct("source").getInt64("ts_ms")));
@@ -119,19 +129,24 @@ public class DebeziumTransform<R extends ConnectRecord<R>> implements Transforma
     }
 
     // create the new value
-    Schema newValueSchema = makeUpdatedSchema(payloadSchema, cdcSchema, beforeImageSchema);
+    Schema newValueSchema = updatedSchema(payloadSchema, cdcSchema, beforeImageSchema);
     Struct newValue = new Struct(newValueSchema);
 
-    for (Field field : payloadSchema.fields()) {
-      newValue.put(field.name(), payload.get(field));
+    // The payload fields come first in the new schema, in the same order, followed by the CDC
+    // fields, so they are set by position instead of by name.
+    List<Field> payloadFields = payloadSchema.fields();
+    List<Field> newFields = newValueSchema.fields();
+    int fieldCount = payloadFields.size();
+    for (int i = 0; i < fieldCount; i++) {
+      newValue.put(newFields.get(i), payload.get(payloadFields.get(i)));
     }
-    newValue.put("_cdc_op", cdcMetadata.get(CdcConstants.COL_OP));
-    newValue.put("_cdc_tsms", cdcMetadata.get(CdcConstants.COL_TS));
-    newValue.put(CdcConstants.COL_CDC, cdcMetadata);
+    newValue.put(newFields.get(fieldCount), cdcMetadata.get(CdcConstants.COL_OP));
+    newValue.put(newFields.get(fieldCount + 1), cdcMetadata.get(CdcConstants.COL_TS));
+    newValue.put(newFields.get(fieldCount + 2), cdcMetadata);
 
     // Add before image for UPDATE operations
     if (beforeImage != null) {
-      newValue.put(CdcConstants.COL_BEFORE_IMAGE, beforeImage);
+      newValue.put(newFields.get(fieldCount + 3), beforeImage);
     }
 
     return record.newRecord(
@@ -352,6 +367,34 @@ public class DebeziumTransform<R extends ConnectRecord<R>> implements Transforma
         : cdcTargetPattern.replace(DB_PLACEHOLDER, db).replace(TABLE_PLACEHOLDER, table);
   }
 
+  private Schema cdcSchema(Schema keySchema) {
+    // a SchemaBuilder can still change after it was used, so only built schemas are cached
+    if (keySchema != null && !(keySchema instanceof ConnectSchema)) {
+      return makeCdcSchema(keySchema);
+    }
+    SchemaKey key = new SchemaKey(keySchema, null, null);
+    Schema cdcSchema = cdcSchemas.get(key);
+    if (cdcSchema == null) {
+      cdcSchema = makeCdcSchema(keySchema);
+      cdcSchemas.put(key, cdcSchema);
+    }
+    return cdcSchema;
+  }
+
+  private Schema updatedSchema(Schema schema, Schema cdcSchema, Schema beforeImageSchema) {
+    if (!(schema instanceof ConnectSchema)
+        || (beforeImageSchema != null && !(beforeImageSchema instanceof ConnectSchema))) {
+      return makeUpdatedSchema(schema, cdcSchema, beforeImageSchema);
+    }
+    SchemaKey key = new SchemaKey(schema, cdcSchema, beforeImageSchema);
+    Schema updatedSchema = updatedSchemas.get(key);
+    if (updatedSchema == null) {
+      updatedSchema = makeUpdatedSchema(schema, cdcSchema, beforeImageSchema);
+      updatedSchemas.put(key, updatedSchema);
+    }
+    return updatedSchema;
+  }
+
   private Schema makeCdcSchema(Schema keySchema) {
     SchemaBuilder builder =
         SchemaBuilder.struct()
@@ -400,6 +443,75 @@ public class DebeziumTransform<R extends ConnectRecord<R>> implements Transforma
     return CONFIG_DEF;
   }
 
+  @VisibleForTesting
+  int cachedSchemaCount() {
+    return cdcSchemas.size() + updatedSchemas.size();
+  }
+
   @Override
-  public void close() {}
+  public void close() {
+    cdcSchemas.clear();
+    updatedSchemas.clear();
+  }
+
+  /** Up to three schemas compared by identity, a deep Schema.equals would walk every field. */
+  private static final class SchemaKey {
+    private final Schema first;
+    private final Schema second;
+    private final Schema third;
+    private final int hash;
+
+    SchemaKey(Schema first, Schema second, Schema third) {
+      this.first = first;
+      this.second = second;
+      this.third = third;
+      this.hash =
+          31 * (31 * System.identityHashCode(first) + System.identityHashCode(second))
+              + System.identityHashCode(third);
+    }
+
+    @Override
+    public int hashCode() {
+      return hash;
+    }
+
+    @Override
+    public boolean equals(Object other) {
+      if (this == other) {
+        return true;
+      }
+      if (!(other instanceof SchemaKey)) {
+        return false;
+      }
+      SchemaKey that = (SchemaKey) other;
+      return first == that.first && second == that.second && third == that.third;
+    }
+  }
+
+  /** Least recently used schemas, the transform may be called from more than one thread. */
+  private static final class SchemaCache {
+    private final Map<SchemaKey, Schema> cache =
+        new LinkedHashMap<SchemaKey, Schema>(16, 0.75f, true) {
+          @Override
+          protected boolean removeEldestEntry(Map.Entry<SchemaKey, Schema> eldest) {
+            return size() > SCHEMA_CACHE_SIZE;
+          }
+        };
+
+    synchronized Schema get(SchemaKey key) {
+      return cache.get(key);
+    }
+
+    synchronized void put(SchemaKey key, Schema schema) {
+      cache.put(key, schema);
+    }
+
+    synchronized int size() {
+      return cache.size();
+    }
+
+    synchronized void clear() {
+      cache.clear();
+    }
+  }
 }

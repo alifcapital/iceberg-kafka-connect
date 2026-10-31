@@ -23,6 +23,7 @@ import io.tabular.iceberg.connect.data.SchemaUpdate.Consumer;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.Arrays;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -38,6 +39,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.TypeUtil;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.connect.data.ConnectSchema;
 import org.apache.kafka.connect.data.Field;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.Struct;
@@ -59,6 +61,10 @@ public class IcebergWriter implements RecordWriter {
 
   // Bounded cache scoped to the current table schema and this writer's immutable config.
   private final Map<Schema, Boolean> validatedSchemas = new LinkedHashMap<>();
+  // The instances already found in validatedSchemas. A Schema is hashed and compared field by
+  // field, which is wasted on every record of a schema the converter hands out as one instance.
+  // Cleared together with validatedSchemas.
+  private final Map<Schema, Boolean> validatedSchemaInstances = new IdentityHashMap<>();
   private Schema validatedKeySchema;
   private int validatedTableSchemaId = -1;
   private final Map<List<Object>, CompactKeyMap> pendingKeys = Maps.newHashMap();
@@ -78,6 +84,7 @@ public class IcebergWriter implements RecordWriter {
 
   private void initNewWriter() {
     validatedSchemas.clear();
+    validatedSchemaInstances.clear();
     validatedKeySchema = null;
     validatedTableSchemaId = table.schema().schemaId();
     this.writer = Utilities.createTableWriter(table, tableName, config);
@@ -181,7 +188,7 @@ public class IcebergWriter implements RecordWriter {
     }
     validateKey(record.keySchema());
     if (record.valueSchema() != null) {
-      if (!validatedSchemas.containsKey(record.valueSchema())) {
+      if (!isValidated(record.valueSchema())) {
         boolean cdcWithoutKey =
             !config.tableConfig(tableName).appendOnly()
                 && (config.tablesCdcField() != null || config.upsertModeEnabled())
@@ -201,8 +208,10 @@ public class IcebergWriter implements RecordWriter {
         }
         if (validatedSchemas.size() >= 64) {
           validatedSchemas.clear();
+          validatedSchemaInstances.clear();
         }
         validatedSchemas.put(record.valueSchema(), Boolean.TRUE);
+        rememberValidated(record.valueSchema());
       }
       return recordConverter.convert(record.value());
     }
@@ -223,6 +232,30 @@ public class IcebergWriter implements RecordWriter {
     }
 
     return row;
+  }
+
+  private boolean isValidated(Schema schema) {
+    // a ConnectSchema never changes, a SchemaBuilder might
+    if (schema instanceof ConnectSchema) {
+      if (validatedSchemaInstances.containsKey(schema)) {
+        return true;
+      }
+      if (validatedSchemas.containsKey(schema)) {
+        rememberValidated(schema);
+        return true;
+      }
+      return false;
+    }
+    return validatedSchemas.containsKey(schema);
+  }
+
+  private void rememberValidated(Schema schema) {
+    if (schema instanceof ConnectSchema) {
+      if (validatedSchemaInstances.size() >= 64) {
+        validatedSchemaInstances.clear();
+      }
+      validatedSchemaInstances.put(schema, Boolean.TRUE);
+    }
   }
 
   private void validateKey(Schema keySchema) {
