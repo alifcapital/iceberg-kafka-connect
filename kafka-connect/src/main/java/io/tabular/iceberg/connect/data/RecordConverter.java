@@ -40,6 +40,7 @@ import java.time.format.DateTimeParseException;
 import java.time.temporal.Temporal;
 import java.util.Base64;
 import java.util.Date;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -67,6 +68,7 @@ import org.apache.iceberg.types.Types.NestedField;
 import org.apache.iceberg.types.Types.StructType;
 import org.apache.iceberg.types.Types.TimestampType;
 import org.apache.iceberg.util.DateTimeUtil;
+import org.apache.kafka.connect.data.ConnectSchema;
 import org.apache.kafka.connect.data.Field;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.errors.ConnectException;
@@ -91,6 +93,14 @@ public class RecordConverter {
   private final Set<Integer> identifierFieldIds;
   private final Map<Integer, Map<String, NestedField>> structNameMap = Maps.newHashMap();
   private final boolean writeBeforeImageToIceberg;
+  // The source schema instances found in sourceFieldIds, so that the schema is not hashed again.
+  private final Map<org.apache.kafka.connect.data.Schema, Set<Integer>> sourceFieldIdsByInstance =
+      new IdentityHashMap<>();
+  // The table field of every field of a source struct schema, by the table struct and the
+  // source schema instance. The table schema of a converter never changes, a changed table gets a
+  // new converter, so a mapping stays valid for as long as the converter lives.
+  private final Map<StructType, Map<org.apache.kafka.connect.data.Schema, FieldMapping>>
+      fieldMappings = new IdentityHashMap<>();
 
   public RecordConverter(Table table, IcebergSinkConfig config) {
     this(table, config, false);
@@ -148,10 +158,26 @@ public class RecordConverter {
   private Set<Integer> sourceFieldIds(Object data) {
     if (data instanceof Struct) {
       org.apache.kafka.connect.data.Schema source = ((Struct) data).schema();
+      // a ConnectSchema never changes, a SchemaBuilder might
+      boolean immutable = source instanceof ConnectSchema;
+      if (immutable) {
+        Set<Integer> ids = sourceFieldIdsByInstance.get(source);
+        if (ids != null) {
+          return ids;
+        }
+      }
       if (sourceFieldIds.size() >= 64) {
         sourceFieldIds.clear();
       }
-      return sourceFieldIds.computeIfAbsent(source, ignored -> collectSourceFieldIds(source, null));
+      Set<Integer> ids =
+          sourceFieldIds.computeIfAbsent(source, ignored -> collectSourceFieldIds(source, null));
+      if (immutable) {
+        if (sourceFieldIdsByInstance.size() >= 64) {
+          sourceFieldIdsByInstance.clear();
+        }
+        sourceFieldIdsByInstance.put(source, ids);
+      }
+      return ids;
     }
     return collectSourceFieldIds(null, data);
   }
@@ -610,21 +636,19 @@ public class RecordConverter {
 
     GenericRecord result = GenericRecord.create(schema);
 
-    for (Field recordField : struct.schema().fields()) {
-      String recordFieldName = recordField.name();
-
-      // Handle _before_image field
-      if ("_before_image".equals(recordFieldName)) {
-        if (writeBeforeImageToIceberg) {
-          // Rename to _cdc_before_image and write to Iceberg
-          recordFieldName = "_cdc_before_image";
-        } else {
-          // Skip - it's only used for delete logic, not stored in Iceberg
-          continue;
-        }
+    List<Field> recordFields = struct.schema().fields();
+    FieldMapping mapping = fieldMapping(struct.schema(), recordFields, schema, structFieldId);
+    for (int i = 0; i < recordFields.size(); i++) {
+      if (mapping.skipped[i]) {
+        // _before_image is only used for delete logic, not stored in Iceberg
+        continue;
       }
 
-      NestedField tableField = lookupStructField(recordFieldName, schema, structFieldId);
+      Field recordField = recordFields.get(i);
+      // _before_image is renamed to _cdc_before_image and written to Iceberg
+      String recordFieldName = mapping.names[i];
+
+      NestedField tableField = mapping.tableFields[i];
       if (tableField == null) {
         // add the column if schema evolution is on, otherwise skip the value
         if (schemaUpdateConsumer != null) {
@@ -657,8 +681,8 @@ public class RecordConverter {
         }
 
         if (!hasSchemaUpdates) {
-          result.setField(
-              tableField.name(),
+          result.set(
+              mapping.positions[i],
               convertValue(
                   struct.get(recordField),
                   tableField.type(),
@@ -670,6 +694,78 @@ public class RecordConverter {
     }
 
     return result;
+  }
+
+  /** What a source struct schema maps to in a table struct, resolved once per field. */
+  private static final class FieldMapping {
+    private final boolean caseInsensitive;
+    private final boolean[] skipped;
+    // the name of the source field in the table, which differs for the before image
+    private final String[] names;
+    private final NestedField[] tableFields;
+    // the position of the table field in the table struct
+    private final int[] positions;
+
+    FieldMapping(boolean caseInsensitive, int size) {
+      this.caseInsensitive = caseInsensitive;
+      this.skipped = new boolean[size];
+      this.names = new String[size];
+      this.tableFields = new NestedField[size];
+      this.positions = new int[size];
+    }
+  }
+
+  private FieldMapping fieldMapping(
+      org.apache.kafka.connect.data.Schema source,
+      List<Field> recordFields,
+      StructType schema,
+      int structFieldId) {
+    boolean caseInsensitive = config.schemaCaseInsensitive();
+    // a SchemaBuilder can still change, so only a built schema is remembered
+    if (!(source instanceof ConnectSchema)) {
+      return resolveFieldMapping(recordFields, schema, structFieldId, caseInsensitive);
+    }
+
+    Map<org.apache.kafka.connect.data.Schema, FieldMapping> mappings =
+        fieldMappings.computeIfAbsent(schema, ignored -> new IdentityHashMap<>());
+    FieldMapping mapping = mappings.get(source);
+    if (mapping == null || mapping.caseInsensitive != caseInsensitive) {
+      if (mappings.size() >= 64) {
+        mappings.clear();
+      }
+      mapping = resolveFieldMapping(recordFields, schema, structFieldId, caseInsensitive);
+      mappings.put(source, mapping);
+    }
+    return mapping;
+  }
+
+  private FieldMapping resolveFieldMapping(
+      List<Field> recordFields, StructType schema, int structFieldId, boolean caseInsensitive) {
+    FieldMapping mapping = new FieldMapping(caseInsensitive, recordFields.size());
+    List<NestedField> tableFields = schema.fields();
+    for (int i = 0; i < recordFields.size(); i++) {
+      String recordFieldName = recordFields.get(i).name();
+
+      // Handle _before_image field
+      if ("_before_image".equals(recordFieldName)) {
+        if (writeBeforeImageToIceberg) {
+          // Rename to _cdc_before_image and write to Iceberg
+          recordFieldName = "_cdc_before_image";
+        } else {
+          // Skip - it's only used for delete logic, not stored in Iceberg
+          mapping.skipped[i] = true;
+          continue;
+        }
+      }
+
+      mapping.names[i] = recordFieldName;
+      NestedField tableField = lookupStructField(recordFieldName, schema, structFieldId);
+      mapping.tableFields[i] = tableField;
+      if (tableField != null) {
+        mapping.positions[i] = tableFields.indexOf(tableField);
+      }
+    }
+    return mapping;
   }
 
   private NestedField lookupStructField(String fieldName, StructType schema, int structFieldId) {
