@@ -35,7 +35,6 @@ import java.util.Map;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
-import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.connect.sink.SinkRecord;
@@ -53,6 +52,9 @@ class Worker implements Writer, AutoCloseable {
   private RecordConversionException deferredFailure;
   private boolean madeProgress;
   private int tablesWrittenForRecord;
+  // the route field split into its path, once for as long as the route field stays the same
+  private String splitRouteField;
+  private String[] splitRouteFieldPath;
 
   Worker(IcebergSinkConfig config, Catalog catalog) {
     this(config, new IcebergWriterFactory(catalog, config));
@@ -186,7 +188,13 @@ class Worker implements Writer, AutoCloseable {
 
   private void routeRecordDynamically(SinkRecord record) {
     String routeField = config.tablesRouteField();
-    Preconditions.checkNotNull(routeField, String.format("Route field cannot be null with dynamic routing at topic: %s, partition: %d, offset: %d", record.topic(), record.kafkaPartition(), record.kafkaOffset()));
+    if (routeField == null) {
+      // formatted only when thrown, not for every record
+      throw new NullPointerException(
+          String.format(
+              "Route field cannot be null with dynamic routing at topic: %s, partition: %d, offset: %d",
+              record.topic(), record.kafkaPartition(), record.kafkaOffset()));
+    }
 
     String routeValue = extractRouteValue(record.value(), routeField);
     if (routeValue != null) {
@@ -199,8 +207,16 @@ class Worker implements Writer, AutoCloseable {
     if (recordValue == null) {
       return null;
     }
-    Object routeValue = Utilities.extractFromRecordValue(recordValue, routeField);
+    Object routeValue = Utilities.extractFromRecordValue(recordValue, routeFieldPath(routeField));
     return routeValue == null ? null : routeValue.toString();
+  }
+
+  private String[] routeFieldPath(String field) {
+    if (!field.equals(splitRouteField)) {
+      splitRouteFieldPath = Utilities.fieldPath(field);
+      splitRouteField = field;
+    }
+    return splitRouteFieldPath;
   }
 
   private void writeToTable(String tableName, SinkRecord record, boolean ignoreMissingTable) {

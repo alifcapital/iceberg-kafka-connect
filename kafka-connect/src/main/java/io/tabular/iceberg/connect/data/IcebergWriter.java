@@ -51,6 +51,7 @@ import org.slf4j.LoggerFactory;
 public class IcebergWriter implements RecordWriter {
 
   private static final Logger LOG = LoggerFactory.getLogger(IcebergWriter.class);
+  private static final String[] BEFORE_IMAGE_PATH = {"_before_image"};
 
   private final Table table;
   private final String tableName;
@@ -70,6 +71,9 @@ public class IcebergWriter implements RecordWriter {
   private final Map<List<Object>, CompactKeyMap> pendingKeys = Maps.newHashMap();
   private RecordConverter recordConverter;
   private TaskWriter<Record> writer;
+  // the CDC field split into its path, once for as long as the CDC field stays the same
+  private String splitCdcField;
+  private String[] splitCdcFieldPath;
 
   public IcebergWriter(
       Table table, String tableName, IcebergSinkConfig config, boolean hasReliablePk) {
@@ -304,8 +308,12 @@ public class IcebergWriter implements RecordWriter {
             || TypeUtil.isPromotionAllowed(current, incoming.asPrimitiveType()));
   }
 
-  private Operation extractCdcOperation(Object recordValue, String cdcField) {
-    Object opValue = Utilities.extractFromRecordValue(recordValue, cdcField);
+  private Operation extractCdcOperation(Object recordValue, String field) {
+    if (!field.equals(splitCdcField)) {
+      splitCdcFieldPath = Utilities.fieldPath(field);
+      splitCdcField = field;
+    }
+    Object opValue = Utilities.extractFromRecordValue(recordValue, splitCdcFieldPath);
 
     if (opValue == null) {
       return Operation.INSERT;
@@ -343,7 +351,7 @@ public class IcebergWriter implements RecordWriter {
       }
     }
 
-    Object beforeImage = Utilities.extractFromRecordValue(recordValue, "_before_image");
+    Object beforeImage = Utilities.extractFromRecordValue(recordValue, BEFORE_IMAGE_PATH);
     if (beforeImage == null) {
       return null;
     }

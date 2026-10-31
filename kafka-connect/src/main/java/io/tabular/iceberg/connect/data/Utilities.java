@@ -124,7 +124,15 @@ public class Utilities {
   }
 
   public static Object extractFromRecordValue(Object recordValue, String fieldName) {
-    String[] fields = fieldName.split("\\.");
+    return extractFromRecordValue(recordValue, fieldPath(fieldName));
+  }
+
+  /** The path of a possibly nested field, to be split once and used for every record. */
+  public static String[] fieldPath(String fieldName) {
+    return fieldName.split("\\.");
+  }
+
+  public static Object extractFromRecordValue(Object recordValue, String[] fields) {
     if (recordValue instanceof Struct) {
       return getValueFromStruct((Struct) recordValue, fields, 0);
     } else if (recordValue instanceof Map) {

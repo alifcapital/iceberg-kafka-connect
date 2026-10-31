@@ -164,6 +164,53 @@ public class UtilitiesTest {
   }
 
   @Test
+  public void testExtractFromRecordValueWithSplitPathMatchesFieldName() {
+    Schema idSchema = SchemaBuilder.struct().field("key", Schema.OPTIONAL_INT64_SCHEMA).build();
+    Schema dataSchema = SchemaBuilder.struct().optional().field("id", idSchema).build();
+    Schema valSchema =
+        SchemaBuilder.struct()
+            .field("data", dataSchema)
+            .field("plain", Schema.STRING_SCHEMA)
+            .build();
+    Struct full =
+        new Struct(valSchema)
+            .put("data", new Struct(dataSchema).put("id", new Struct(idSchema).put("key", 7L)))
+            .put("plain", "p");
+    Struct nullKey =
+        new Struct(valSchema)
+            .put("data", new Struct(dataSchema).put("id", new Struct(idSchema)))
+            .put("plain", "p");
+    Struct nullData = new Struct(valSchema).put("plain", "p");
+    Map<String, Object> map =
+        ImmutableMap.of("data", ImmutableMap.of("id", ImmutableMap.of("key", 7L)), "plain", "p");
+
+    for (Object value : new Object[] {full, nullKey, nullData, map}) {
+      for (String name : new String[] {"data.id.key", "data.id", "data", "plain", "plain.more"}) {
+        Object expected = null;
+        Throwable expectedFailure = null;
+        try {
+          expected = Utilities.extractFromRecordValue(value, name);
+        } catch (RuntimeException e) {
+          expectedFailure = e;
+        }
+        String[] path = Utilities.fieldPath(name);
+        if (expectedFailure == null) {
+          assertThat(Utilities.extractFromRecordValue(value, path)).isEqualTo(expected);
+        } else {
+          assertThatThrownBy(() -> Utilities.extractFromRecordValue(value, path))
+              .isInstanceOf(expectedFailure.getClass())
+              .hasMessage(expectedFailure.getMessage());
+        }
+      }
+    }
+    assertThat(Utilities.fieldPath("a.b.c")).containsExactly("a", "b", "c");
+    assertThat(Utilities.fieldPath("_before_image")).containsExactly("_before_image");
+    assertThatThrownBy(() -> Utilities.extractFromRecordValue("text", Utilities.fieldPath("a")))
+        .isInstanceOf(UnsupportedOperationException.class)
+        .hasMessage("Cannot extract value from type: java.lang.String");
+  }
+
+  @Test
   public void testCollectEqualityDeleteFieldIds_simplePrimitives() {
     org.apache.iceberg.Schema schema =
         new org.apache.iceberg.Schema(
