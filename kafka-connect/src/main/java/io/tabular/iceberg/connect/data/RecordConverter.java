@@ -29,6 +29,7 @@ import java.math.BigInteger;
 import java.math.RoundingMode;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
@@ -233,31 +234,54 @@ public class RecordConverter {
     }
   }
 
-  /** Plan all changes from the schema, including null structs and empty collections. */
+  /**
+   * Plan all changes from the schema, including null structs and empty collections.
+   *
+   * @param upsertTable rows of the table are deleted and updated, so the shape of its source fields
+   *     is checked against what change events carry for existing rows
+   */
   public SchemaUpdate.Consumer planSchema(
-      org.apache.kafka.connect.data.Schema source, boolean cdcWithoutKey) {
+      org.apache.kafka.connect.data.Schema source, boolean upsertTable) {
     if (source.type() != org.apache.kafka.connect.data.Schema.Type.STRUCT) {
       throw new ConnectException("Expected a struct schema for an Iceberg row");
     }
     SchemaUpdate.Consumer updates = new SchemaUpdate.Consumer();
-    planStruct(source, tableSchema.asStruct(), -1, null, cdcWithoutKey, updates);
-    if (cdcWithoutKey
+    planStruct(source, tableSchema.asStruct(), -1, null, upsertTable, updates);
+    if (upsertTable
+        && withoutKey()
         && Sets.intersection(
                 collectSourceFieldIds(source, null),
                 Utilities.collectEqualityDeleteFieldIds(tableSchema, "schema preflight"))
             .isEmpty()) {
-      throw new ConnectException("Cannot DROP all equality fields in CDC without a primary key");
+      throw new ConnectException(
+          "Cannot DROP all equality fields of upsert table " + tableName + " without a primary key");
     }
     return updates;
   }
 
+  /** Without identifier fields, deletes match rows by all their columns. */
+  private boolean withoutKey() {
+    return identifierFieldIds.isEmpty();
+  }
+
+  /** _cdc metadata and the before image come from the transform, not from the source table. */
+  private static boolean isCdcMetadata(String name) {
+    return name.equals("_cdc") || name.startsWith("_cdc_");
+  }
+
+  /**
+   * Plan the changes of one struct level.
+   *
+   * @param strict the fields come from the source table of an upsert table, so a change that
+   *     existing rows in Iceberg cannot follow fails instead of being applied
+   */
   @SuppressWarnings("checkstyle:CyclomaticComplexity")
   private void planStruct(
       org.apache.kafka.connect.data.Schema source,
       StructType target,
       int parentId,
       String parentPath,
-      boolean cdcWithoutKey,
+      boolean strict,
       SchemaUpdate.Consumer updates) {
     Set<Integer> present = Sets.newHashSet();
     for (Field field : source.fields()) {
@@ -269,34 +293,23 @@ public class RecordConverter {
         name = "_cdc_before_image";
       }
       String path = parentPath == null ? name : parentPath + "." + name;
-      boolean protectedShape = cdcWithoutKey && !name.equals("_cdc") && !name.startsWith("_cdc_");
+      boolean strictField = strict && !isCdcMetadata(name);
+      Object defaultValue = field.schema().defaultValue();
       NestedField existing = lookupStructField(name, target, parentId);
       if (existing == null) {
-        // Rows written before ADD read as null in Iceberg. Without a default the source agrees,
-        // so before images still match them; a source default would not.
-        Object defaultValue = field.schema().defaultValue();
-        if (protectedShape && defaultValue != null) {
-          throw new ConnectException(
-              "Cannot ADD "
-                  + path
-                  + " with default "
-                  + defaultValue
-                  + " to table "
-                  + tableName
-                  + " in CDC without a primary key: existing Iceberg rows would keep null"
-                  + " while source rows have the default, backfill them manually");
+        // Old rows stay null in Iceberg, but the source has the default for them.
+        if (strictField && defaultValue != null) {
+          throw new ConnectException(addedWithDefault(path, defaultValue));
         }
         updates.addColumn(parentPath, name, SchemaUtils.toIcebergType(field.schema(), config));
       } else {
         present.add(existing.fieldId());
         String actualPath = tableSchema.findColumnName(existing.fieldId());
-        planField(field.schema(), existing, actualPath, protectedShape, updates);
+        planField(field.schema(), existing, actualPath, strictField, updates);
         if (parentPath == null && SourceDropMarker.isDropped(existing.doc())) {
-          if (protectedShape) {
-            // Rows written before the drop still hold the old values in Iceberg, while the source
-            // now has null or the column default: before images would stop matching them.
-            throw new ConnectException(
-                columnBackInNoPkTable(actualPath, existing.doc(), field.schema().defaultValue()));
+          // Old rows keep their pre-drop values in Iceberg, but the source has null or the default.
+          if (strictField) {
+            throw new ConnectException(cameBackInSource(actualPath, existing.doc(), defaultValue));
           }
           updates.markRestored(actualPath);
         }
@@ -304,16 +317,18 @@ public class RecordConverter {
     }
     for (NestedField existing : target.fields()) {
       // CDC metadata and before images are absent in some operations by design.
-      if (!present.contains(existing.fieldId())
-          && !existing.name().equals("_cdc")
-          && !existing.name().startsWith("_cdc_")) {
+      if (!present.contains(existing.fieldId()) && !isCdcMetadata(existing.name())) {
         String path = tableSchema.findColumnName(existing.fieldId());
         if (containsIdentifier(existing.type(), existing.fieldId())) {
           throw new ConnectException("Cannot DROP identifier field " + path);
         }
-        if (cdcWithoutKey && containsPartitionSource(existing)) {
+        if (strict && withoutKey() && containsPartitionSource(existing)) {
           throw new ConnectException(
-              "Cannot DROP partition source field " + path + " in CDC without a primary key");
+              "Cannot DROP partition source field "
+                  + path
+                  + " of upsert table "
+                  + tableName
+                  + " without a primary key");
         }
         if (existing.isRequired()) {
           updates.makeOptional(path);
@@ -331,39 +346,27 @@ public class RecordConverter {
     }
   }
 
-  /** Error text with ready-to-run Spark commands to bring the column in line with the source. */
-  private String columnBackInNoPkTable(String column, String doc, Object defaultValue) {
-    String[] parts = tableName == null ? new String[0] : tableName.split("\\.");
-    String dbTable =
-        parts.length >= 2 ? parts[parts.length - 2] + "." + parts[parts.length - 1] : tableName;
-    String sparkTable = "glue." + dbTable;
-    String comment =
-        SourceDropMarker.restoredDoc(java.time.Instant.now(), doc).replace("'", "''");
-    String value = defaultValue == null ? "NULL" : "NULL /* or the column default: " + defaultValue + " */";
-    return "Column "
-        + column
-        + " of table "
-        + dbTable
-        + " came back in the source, but the table has no primary key.\n"
-        + "Old values in Iceberg do not match the source, so deletes and updates would stop"
-        + " matching.\n"
-        + "Fix it in Spark, then restart the task:\n"
-        + "  UPDATE "
-        + sparkTable
-        + " SET "
-        + column
-        + " = "
-        + value
-        + " WHERE "
-        + column
-        + " IS NOT NULL;\n"
-        + "  ALTER TABLE "
-        + sparkTable
-        + " ALTER COLUMN "
-        + column
-        + " COMMENT '"
-        + comment
-        + "';";
+  private String addedWithDefault(String column, Object defaultValue) {
+    return String.format(
+        "Cannot ADD %s with default %s to upsert table %s: existing Iceberg rows would keep null"
+            + " while source rows have the default, backfill them manually",
+        column, defaultValue, tableName);
+  }
+
+  private String cameBackInSource(String column, String doc, Object defaultValue) {
+    String sourceValue = defaultValue == null ? "null" : "the default";
+    return String.format(
+        "Column %s of upsert table %s came back in the source %s. Rows written before the drop"
+            + " still hold their old values in Iceberg, while the source has %s for them%s. Set"
+            + " the column to %s for those rows and replace the column doc marker with \"%s\","
+            + " then restart the task.",
+        column,
+        tableName,
+        defaultValue == null ? "without a default" : "with default " + defaultValue,
+        sourceValue,
+        withoutKey() ? ", so deletes and updates would stop matching them" : "",
+        sourceValue,
+        SourceDropMarker.restoredDoc(Instant.now(), doc));
   }
 
   private boolean containsIdentifier(Type type, int fieldId) {
@@ -385,7 +388,7 @@ public class RecordConverter {
       org.apache.kafka.connect.data.Schema source,
       NestedField target,
       String path,
-      boolean cdcWithoutKey,
+      boolean strict,
       SchemaUpdate.Consumer updates) {
     if (source.isOptional() && containsIdentifier(target.type(), target.fieldId())) {
       throw new ConnectException("Cannot make identifier field nullable: " + path);
@@ -396,13 +399,13 @@ public class RecordConverter {
     Type incoming = SchemaUtils.toIcebergType(source, config);
     Type current = target.type();
     if (incoming.isStructType() && current.isStructType()) {
-      planStruct(source, current.asStructType(), target.fieldId(), path, cdcWithoutKey, updates);
+      planStruct(source, current.asStructType(), target.fieldId(), path, strict, updates);
     } else if (incoming.isListType() && current.isListType()) {
       planField(
           source.valueSchema(),
           current.asListType().fields().get(0),
           path + ".element",
-          cdcWithoutKey,
+          strict,
           updates);
     } else if (incoming.isMapType() && current.isMapType()) {
       if (!sameTypeIgnoringIds(incoming.asMapType().keyType(), current.asMapType().keyType())) {
@@ -413,7 +416,7 @@ public class RecordConverter {
           source.valueSchema(),
           current.asMapType().fields().get(1),
           path + ".value",
-          cdcWithoutKey,
+          strict,
           updates);
     } else if (incoming.isPrimitiveType() && current.isPrimitiveType()) {
       if (TypeUtil.isPromotionAllowed(incoming, current.asPrimitiveType())) {

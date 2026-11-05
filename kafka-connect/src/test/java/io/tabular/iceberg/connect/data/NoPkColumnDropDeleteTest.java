@@ -242,10 +242,10 @@ class NoPkColumnDropDeleteTest {
                           null,
                           0)))
           .hasRootCauseMessage(
-              "Cannot ADD c with default {} to table "
+              "Cannot ADD c with default {} to upsert table "
                   + table.name()
-                  + " in CDC without a primary key: existing Iceberg rows would keep null"
-                  + " while source rows have the default, backfill them manually");
+                  + ": existing Iceberg rows would keep null while source rows have the default,"
+                  + " backfill them manually");
       assertThat(table.schema().schemaId()).isEqualTo(schemaId);
       assertThat(writer.complete().dataOffsets()).isEmpty();
     } finally {
@@ -359,7 +359,10 @@ class NoPkColumnDropDeleteTest {
                           onlyB,
                           new Struct(onlyB).put("b", 20).put("_cdc_op", "D"),
                           0)))
-          .hasRootCauseMessage("Cannot DROP partition source field a in CDC without a primary key");
+          .hasRootCauseMessage(
+              "Cannot DROP partition source field a of upsert table "
+                  + table.name()
+                  + " without a primary key");
       assertThat(table.schema().schemaId()).isEqualTo(schemaId);
       assertThat(writer.complete().dataOffsets()).isEmpty();
     } finally {

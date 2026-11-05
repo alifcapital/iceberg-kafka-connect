@@ -356,9 +356,9 @@ Compatible identifier widening such as `int` to `long` is supported. Pending row
 positions survive writer rotations within a commit window, so CDC deletes can still
 remove records written before a schema change in the same commit.
 
-In CDC/upsert mode without table identifiers (including tables created with
-`iceberg.table.<table>.has-real-pk=false`), ordinary source fields can disappear. The
-Iceberg columns remain optional. DELETE and UPDATE before images compare only the
+In upsert tables (CDC or upsert mode, not append-only) without table identifiers (including
+tables created with `iceberg.table.<table>.has-real-pk=false`), ordinary source fields can
+disappear. The Iceberg columns remain optional. DELETE and UPDATE before images compare only the
 fields present in the source schema; an explicit null remains an equality condition.
 Files with different equality-field sets are written separately. The same condition
 removes matching pending rows using position deletes, including across writer rotations.
@@ -373,6 +373,20 @@ re-keyed with null for the new column. A field added with a default (Debezium pr
 column defaults into the Connect schema) fails schema preflight: the source reports the
 default for existing rows while Iceberg keeps null, so their deletes would not match.
 Backfill those rows in Iceberg manually before resuming.
+
+In upsert tables with table identifiers, a field added with a default fails the same way.
+Deletes still match by key there, but existing rows would silently keep null:
+PostgreSQL stores a constant `ADD COLUMN ... DEFAULT` in the catalog without rewriting rows,
+so no change event ever carries the default for them. Add the column and backfill the
+default in Iceberg manually before resuming. Append-only tables keep adding such fields as
+before.
+
+A field that disappeared from the source and comes back keeps its old values in Iceberg for
+rows written before the drop, while the source now has null or the column default for them.
+In upsert tables this fails with or without table identifiers and with or without a default;
+without table identifiers deletes and updates would also stop matching those rows. The
+error says which value to set for the old rows and which restored marker to put into the
+column doc.
 
 Dropping all equality fields and dropping a partition source field still fail schema
 preflight. Partition sources from historical specs are protected

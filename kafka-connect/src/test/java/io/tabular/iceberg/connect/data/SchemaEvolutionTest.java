@@ -422,7 +422,7 @@ class SchemaEvolutionTest {
                           new Struct(source).put("x", 1).put("new_col", "new"),
                           42)))
           .rootCause()
-          .hasMessageContaining("Cannot ADD new_col with default d to table");
+          .hasMessageContaining("Cannot ADD new_col with default d to upsert table");
       assertThat(table.schema().findField("new_col")).isNull();
       assertThat(writer.complete().dataOffsets()).isEmpty();
     } finally {
@@ -460,7 +460,7 @@ class SchemaEvolutionTest {
   }
 
   @Test
-  void columnBackInSourceStopsNoPkCdcTable() {
+  void columnBackInSourceStopsUpsertTable() {
     org.apache.iceberg.Schema marked =
         new org.apache.iceberg.Schema(
             Types.NestedField.optional(1, "x", Types.IntegerType.get()),
@@ -476,11 +476,41 @@ class SchemaEvolutionTest {
             .build();
 
     assertThatThrownBy(() -> converter(marked, config()).planSchema(back, true))
-        .hasMessageContaining("Column gone of table db.test came back in the source")
-        .hasMessageContaining("UPDATE glue.db.test SET gone = NULL WHERE gone IS NOT NULL;")
-        .hasMessageContaining("ALTER TABLE glue.db.test ALTER COLUMN gone COMMENT '[restored in source ")
-        .hasMessageContaining("] Loan''s amount';");
-    // with a primary key the column simply comes back
+        .hasMessageContaining(
+            "Column gone of upsert table iceberg.db.test came back in the source without a default.")
+        .hasMessageContaining("the source has null for them, so deletes and updates would stop")
+        .hasMessageContaining("Set the column to null for those rows")
+        .hasMessageContaining("marker with \"[restored in source ")
+        .hasMessageContaining("] Loan's amount\", then restart the task.");
+    // with a primary key it stops too, with or without a default; deletes still match by key
+    org.apache.iceberg.Schema keyedMarked =
+        new org.apache.iceberg.Schema(
+            List.of(
+                Types.NestedField.required(1, "x", Types.IntegerType.get()),
+                marked.findField("gone")),
+            Set.of(1));
+    Schema keyedBackWithDefault =
+        SchemaBuilder.struct()
+            .field("x", Schema.INT32_SCHEMA)
+            .field("gone", SchemaBuilder.string().optional().defaultValue("d").build())
+            .build();
+    assertThatThrownBy(
+            () -> converter(keyedMarked, config()).planSchema(keyedBackWithDefault, true))
+        .hasMessageContaining(
+            "Column gone of upsert table iceberg.db.test came back in the source with default d.")
+        .hasMessageContaining("the source has the default for them. Set the column to the default")
+        .hasMessageNotContaining("stop matching");
+    Schema keyedBack =
+        SchemaBuilder.struct()
+            .field("x", Schema.INT32_SCHEMA)
+            .field("gone", Schema.OPTIONAL_STRING_SCHEMA)
+            .build();
+    assertThatThrownBy(() -> converter(keyedMarked, config()).planSchema(keyedBack, true))
+        .hasMessageContaining(
+            "Column gone of upsert table iceberg.db.test came back in the source without a default.")
+        .hasMessageContaining("the source has null for them. Set the column to null")
+        .hasMessageNotContaining("stop matching");
+    // not an upsert table: the column simply comes back
     assertThat(converter(marked, config()).planSchema(back, false).sourceDrops())
         .extracting(SchemaUpdate.SourceDrop::name)
         .containsExactly("gone");
@@ -600,6 +630,113 @@ class SchemaEvolutionTest {
           .allSatisfy(offset -> assertThat(offset.offset()).isEqualTo(41L));
     } finally {
       writer.close();
+    }
+  }
+
+  private org.apache.iceberg.Schema keyed() {
+    return new org.apache.iceberg.Schema(one(Types.IntegerType.get()).columns(), Set.of(1));
+  }
+
+  private Schema rowWithAdded(Schema added) {
+    return SchemaBuilder.struct()
+        .field("x", Schema.INT32_SCHEMA)
+        .field("pan_length", added)
+        .build();
+  }
+
+  @Test
+  void addWithDefaultFailsInKeyedUpsertTable() {
+    RecordConverter converter = converter(keyed(), config());
+    assertThatThrownBy(
+            () ->
+                converter.planSchema(
+                    rowWithAdded(SchemaBuilder.int32().optional().defaultValue(16).build()),
+                    true))
+        .hasMessage(
+            "Cannot ADD pan_length with default 16 to upsert table iceberg.db.test: existing"
+                + " Iceberg rows would keep null while source rows have the default, backfill them"
+                + " manually");
+  }
+
+  @Test
+  void addWithoutDefaultOrOutsideUpsertTablesIsAllowed() {
+    RecordConverter converter = converter(keyed(), config());
+    assertThat(
+            converter
+                .planSchema(rowWithAdded(Schema.OPTIONAL_INT32_SCHEMA), true)
+                .addColumns())
+        .extracting(SchemaUpdate.AddColumn::name)
+        .containsExactly("pan_length");
+    // not an upsert table: no deletes or updates, the ADD goes through as before
+    assertThat(
+            converter
+                .planSchema(
+                    rowWithAdded(SchemaBuilder.int32().optional().defaultValue(16).build()),
+                    false)
+                .addColumns())
+        .extracting(SchemaUpdate.AddColumn::name)
+        .containsExactly("pan_length");
+  }
+
+  @Test
+  void existingColumnWithDefaultIsNotAnAdd() {
+    org.apache.iceberg.Schema schema =
+        new org.apache.iceberg.Schema(
+            List.of(
+                Types.NestedField.required(1, "x", Types.IntegerType.get()),
+                Types.NestedField.optional(2, "pan_length", Types.IntegerType.get())),
+            Set.of(1));
+    RecordConverter converter = converter(schema, config());
+    assertThat(
+            converter
+                .planSchema(
+                    rowWithAdded(SchemaBuilder.int32().optional().defaultValue(16).build()),
+                    true)
+                .empty())
+        .isTrue();
+  }
+
+  @Test
+  void writerFailsAddWithDefaultOnlyInUpsertTables() {
+    Schema withDefault =
+        SchemaBuilder.struct()
+            .field("x", Schema.INT32_SCHEMA)
+            .field("op", Schema.STRING_SCHEMA)
+            .field("pan_length", SchemaBuilder.int32().optional().defaultValue(16).build())
+            .build();
+    Struct value = new Struct(withDefault).put("x", 1).put("op", "U").put("pan_length", 16);
+    Schema keySchema = SchemaBuilder.struct().field("x", Schema.INT32_SCHEMA).build();
+    Struct key = new Struct(keySchema).put("x", 1);
+    org.apache.iceberg.Schema schema =
+        new org.apache.iceberg.Schema(
+            List.of(
+                Types.NestedField.required(1, "x", Types.IntegerType.get()),
+                Types.NestedField.required(2, "op", Types.StringType.get())),
+            Set.of(1));
+
+    Table keyedUpsert = table(schema);
+    IcebergWriter upsertWriter =
+        new IcebergWriter(keyedUpsert, "db.test", config("iceberg.tables.cdc-field", "op"), true);
+    try {
+      assertThatThrownBy(
+              () ->
+                  upsertWriter.write(
+                      new SinkRecord("source", 0, keySchema, key, withDefault, value, 1)))
+          .hasStackTraceContaining("Cannot ADD pan_length with default 16");
+      keyedUpsert.refresh();
+      assertThat(keyedUpsert.schema().findField("pan_length")).isNull();
+    } finally {
+      upsertWriter.close();
+    }
+
+    Table appendOnly = table(schema);
+    IcebergWriter appendWriter = new IcebergWriter(appendOnly, "db.test", config(), true);
+    try {
+      appendWriter.write(new SinkRecord("source", 0, keySchema, key, withDefault, value, 1));
+      appendOnly.refresh();
+      assertThat(appendOnly.schema().findField("pan_length")).isNotNull();
+    } finally {
+      appendWriter.close();
     }
   }
 }
