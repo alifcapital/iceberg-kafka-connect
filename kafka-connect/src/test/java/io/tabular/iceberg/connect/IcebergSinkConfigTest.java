@@ -30,6 +30,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.function.Function;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.kafka.common.config.ConfigException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -54,6 +55,27 @@ public class IcebergSinkConfigTest {
     assertThatThrownBy(() -> new IcebergSinkConfig(props))
         .isInstanceOf(ConfigException.class)
         .hasMessage("Cannot specify both static and dynamic table names");
+  }
+
+  @Test
+  public void testIsUpsertTable() {
+    Map<String, String> base =
+        ImmutableMap.of(
+            "iceberg.catalog.type", "rest",
+            "topics", "source-topic",
+            "iceberg.tables", "db.landing,db.log");
+    assertThat(new IcebergSinkConfig(base).isUpsertTable("db.landing")).isFalse();
+
+    Map<String, String> cdc = Maps.newHashMap(base);
+    cdc.put("iceberg.tables.cdc-field", "_cdc.op");
+    cdc.put("iceberg.table.db.log.append-only", "true");
+    IcebergSinkConfig cdcConfig = new IcebergSinkConfig(cdc);
+    assertThat(cdcConfig.isUpsertTable("db.landing")).isTrue();
+    assertThat(cdcConfig.isUpsertTable("db.log")).isFalse();
+
+    Map<String, String> upsert = Maps.newHashMap(base);
+    upsert.put("iceberg.tables.upsert-mode-enabled", "true");
+    assertThat(new IcebergSinkConfig(upsert).isUpsertTable("db.landing")).isTrue();
   }
 
   @Test

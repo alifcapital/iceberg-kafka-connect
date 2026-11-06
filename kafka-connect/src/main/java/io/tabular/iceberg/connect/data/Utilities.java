@@ -173,12 +173,9 @@ public class Utilities {
     Set<Integer> identifierFieldIds = table.schema().identifierFieldIds();
     boolean hasRealPk = identifierFieldIds != null && !identifierFieldIds.isEmpty();
 
-    // If CDC/upsert mode but no identifier fields in schema, use all primitive columns
-    // This supports CDC without PK (like PostgreSQL REPLICA_IDENTITY_FULL)
-    boolean isCdcMode =
-        !config.tableConfig(tableName).appendOnly()
-            && (config.tablesCdcField() != null || config.upsertModeEnabled());
-    if (isCdcMode && !hasRealPk) {
+    // An upsert table without identifier fields uses all primitive columns
+    // for equality deletes (like PostgreSQL REPLICA IDENTITY FULL)
+    if (config.isUpsertTable(tableName) && !hasRealPk) {
       identifierFieldIds = collectEqualityDeleteFieldIds(table.schema(), tableName);
       LOG.info("Upsert mode without PK for table {}, using {} columns for equality delete",
           tableName, identifierFieldIds.size());
@@ -230,9 +227,7 @@ public class Utilities {
             .build();
 
     TaskWriter<Record> writer;
-    boolean appendOnly = config.tableConfig(tableName).appendOnly();
-    boolean useDeltaWriter =
-        !appendOnly && (config.tablesCdcField() != null || config.upsertModeEnabled());
+    boolean useDeltaWriter = config.isUpsertTable(tableName);
 
     if (table.spec().isUnpartitioned()) {
       if (!useDeltaWriter) {

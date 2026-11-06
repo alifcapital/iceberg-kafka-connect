@@ -193,19 +193,16 @@ public class IcebergWriter implements RecordWriter {
     validateKey(record.keySchema());
     if (record.valueSchema() != null) {
       if (!isValidated(record.valueSchema())) {
-        boolean cdcWithoutKey =
-            !config.tableConfig(tableName).appendOnly()
-                && (config.tablesCdcField() != null || config.upsertModeEnabled())
-                && table.schema().identifierFieldIds().isEmpty();
+        boolean upsertTable = config.isUpsertTable(tableName);
         SchemaUpdate.Consumer planned =
-            recordConverter.planSchema(record.valueSchema(), cdcWithoutKey);
+            recordConverter.planSchema(record.valueSchema(), upsertTable);
         if (!planned.empty()) {
           if (!config.evolveSchemaEnabled()) {
             throw new DataException("Schema evolution is disabled for table " + tableName);
           }
           reopenWriter(() -> SchemaUtils.applySchemaUpdates(table, planned));
           // Recheck refreshed metadata, including changes committed by other writers.
-          if (!recordConverter.planSchema(record.valueSchema(), cdcWithoutKey).empty()) {
+          if (!recordConverter.planSchema(record.valueSchema(), upsertTable).empty()) {
             throw new DataException(
                 "Table schema changed concurrently; retry record for " + tableName);
           }

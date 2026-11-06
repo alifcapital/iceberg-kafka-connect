@@ -557,6 +557,15 @@ public class IcebergSinkConfig extends AbstractConfig {
     return upsertModeEnabled;
   }
 
+  /**
+   * An upsert table: its rows are deleted and updated, not only appended. The connector sets a CDC
+   * field or enables upsert mode, and the table is not configured as append-only.
+   */
+  public boolean isUpsertTable(String tableName) {
+    return !tableConfig(tableName).appendOnly()
+        && (tablesCdcField() != null || upsertModeEnabled());
+  }
+
   public boolean autoCreateEnabled() {
     return getBoolean(TABLES_AUTO_CREATE_ENABLED_PROP);
   }

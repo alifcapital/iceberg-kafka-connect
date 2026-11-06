@@ -41,6 +41,7 @@ public class PartitionedDeltaWriterTest extends BaseWriterTest {
   public void testPartitionedDeltaWriter(String format) {
     IcebergSinkConfig config = mock(IcebergSinkConfig.class);
     when(config.upsertModeEnabled()).thenReturn(true);
+    when(config.isUpsertTable(any())).thenReturn(true);
     when(config.tableConfig(any())).thenReturn(mock(TableSinkConfig.class));
     when(config.writeProps()).thenReturn(ImmutableMap.of("write.format.default", format));
 
